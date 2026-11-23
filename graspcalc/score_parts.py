@@ -13,6 +13,8 @@ every object of the category.
               >= min_part_ratio * (reference share) of the candidate contact (hard requirement)
     --afford_parts handle: only the listed affordance parts count; the requirement checks only them and F4p is the
     soft IoU of the 16 x K contact restricted to them (which hand parts touch the handle, renormalised).
+    discount = min(candidate affordance share / reference affordance share, 1) (affordance mode, --share_discount 1):
+    total = F1 * gate * discount, so a faint contact tail on the affordance cannot be renormalised into a full match.
 """
 import argparse
 import glob
@@ -192,8 +194,9 @@ def main(a):
                 need[:, aff] = True
             ok = ((d["P"].sum(1) >= a.min_part_ratio * P_ref.sum(1)) | ~need).all(1).float()
             gate = gate * ok
+            disc = s4a if aff and a.share_discount else torch.ones_like(s1)
             out[oid] = dict(s1=s1.cpu(), s4=s4.cpu(), s4a=s4a.cpu(), s4b=s4b.cpu(), gate=gate.cpu(), ok=ok.cpu(),
-                            total=(s1 * gate).cpu())
+                            disc=disc.cpu(), total=(s1 * gate * disc).cpu())
         return out, i_ref
 
     # 1) one reference for the whole category
@@ -210,17 +213,17 @@ def main(a):
             is_ref = oid == ref_oid and i == i_ref
             rows.append(dict(obj_id=oid, obj=d["name"], gid=g["gid"], intent=g["intent"], is_ref=is_ref,
                              total=r["total"][i].item(), s1_shape=r["s1"][i].item(), s4p=r["s4"][i].item(),
-                             s4p_a=r["s4a"][i].item(), s4p_b=r["s4b"][i].item(), gate=r["gate"][i].item(), part_ok=bool(r["ok"][i]),
+                             s4p_a=r["s4a"][i].item(), s4p_b=r["s4b"][i].item(), gate=r["gate"][i].item(), discount=r["disc"][i].item(), part_ok=bool(r["ok"][i]),
                              part_share={vocab[p]: v for p, v in enumerate(d["P"][i].sum(0).tolist())}))
             if not is_ref:
                 by_intent.setdefault(g["intent"], []).append(rows[-1]["total"])
         order = sorted(range(len(rows)), key=lambda i: -rows[i]["total"])
         print(f"\n=== {d['name']} ({oid})  n={len(rows)}  ref={ref_oid}/{ref_gid}  part-label p95 dist {d['lab_dist_mm']:.1f} mm")
-        print(f"{'gid':<12}{'intent':<10}{'total':>7}{'F1':>7}{'F4p':>7}{'F4p_a':>7}{'F4p_b':>7}{'gate':>7}  object-part share of contact")
+        print(f"{'gid':<12}{'intent':<10}{'total':>7}{'F1':>7}{'F4p':>7}{'F4p_a':>7}{'F4p_b':>7}{'gate':>7}{'disc':>7}  object-part share of contact")
         for i in order:
             x = rows[i]
             print(f"{x['gid']:<12}{x['intent']:<10}{x['total']:>7.3f}{x['s1_shape']:>7.3f}{x['s4p']:>7.3f}"
-                  f"{x['s4p_a']:>7.3f}{x['s4p_b']:>7.3f}{x['gate']:>7.3f}  {share(d['P'][i].cpu())}{'  <- ref' if x['is_ref'] else ''}")
+                  f"{x['s4p_a']:>7.3f}{x['s4p_b']:>7.3f}{x['gate']:>7.3f}{x['discount']:>7.3f}  {share(d['P'][i].cpu())}{'  <- ref' if x['is_ref'] else ''}")
         cand = [i for i in order if not rows[i]["is_ref"]]
         pick = [("best", cand[0]), ("median", cand[len(cand) // 2]), ("worst", cand[-1])]
         panels = [(f"REF {ref_oid}/{ref_gid} ({ref_g['intent']})\n{share(d_ref['P'][i_ref].cpu())}",
@@ -297,6 +300,8 @@ if __name__ == "__main__":
     ap.add_argument("--gate_width", type=float, default=0.05)
     ap.add_argument("--afford_parts", default="", help="comma list, e.g. handle: score contact on these parts only")
     ap.add_argument("--ref_part_min", type=float, default=0.10, help="parts with at least this share of the ref contact are required")
+    ap.add_argument("--share_discount", type=int, default=1,
+                    help="affordance mode: multiply by min(candidate / reference affordance share, 1); 0 disables")
     ap.add_argument("--min_part_ratio", type=float, default=0.0, help="candidate share on a required part >= ratio * ref share; 0 disables")
     ap.add_argument("--n_obj_pts", type=int, default=2048)
     ap.add_argument("--compare", default="", help="factor_scores.json of an older point-wise F4 run for the same category")

@@ -100,6 +100,8 @@ def method_page(pdf, runs):
         f"总分：S = F1 × sigmoid((F4p − {m0['gate_tau']}) / {m0['gate_width']})。"
         + ("无部件占比硬条件。" if m0["min_part_ratio"] <= 0 else
            f"硬条件：参考占比 ≥{m0['ref_part_min']} 的部件，候选占比 < {m0['min_part_ratio']} × 参考时记 0。"),
+        *(["        只看 affordance 时再乘连续折扣 min(候选在 affordance 上的接触占比 / 参考的占比, 1)，"
+            "防止 affordance 上的微弱接触被归一化放大。"] if aff and m0.get("share_discount", 0) else []),
         "        不使用物体对称和镜像，左右手区分。",
         "",
         "参考（每个类别一个参考，给该类别所有实例上的所有抓取打分，意图不参与打分）：",
