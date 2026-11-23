@@ -58,6 +58,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grasp_ref", required=True, help="reference .pt from graspcalc.export_reference")
     parser.add_argument("--afford_part", default="grip", help="reference part the policy should hold")
     parser.add_argument("--score_window", type=int, default=30, help="steps after the first lift that are scored")
+    parser.add_argument("--save_ref", default="", help="save the grasp at the last scored step as a reference .pt")
     parser.add_argument("--downsample_factor", type=int, default=1,
                         help="Downsample factor for trajectory goals.")
     parser.add_argument("--z_offset", type=float, default=0.03,
@@ -221,11 +222,18 @@ def main() -> None:
         po = inner.object.data.root_pos_w[0]
         r = scorer.score(hs, hand.palm_normal_sign, obj_pts @ Ro.T + po, obj_nrm @ Ro.T, obj_lab)
         r = {k: v[0].tolist() if v.dim() > 1 else float(v[0]) for k, v in r.items()}
+        if args.save_ref:
+            r["ref"] = dict(points=hs.points.cpu(), part_ids=hs.part_ids.cpu(), wrist=hs.wrist.cpu(),
+                            fingers={k: v.cpu() for k, v in hs.fingers.items()}, sign=hand.palm_normal_sign, side="left",
+                            obj=(obj_pts @ Ro.T + po).cpu(), obj_n=(obj_nrm @ Ro.T).cpu(), lab=obj_lab.cpu(),
+                            vocab=list(vocab), cat=args.object_category,
+                            ref=f"sim:{args.object_name}/{args.task_name}/ep{len(all_scores)}/lift+{args.score_window - 1}")
         r["hand_points"] = hs.points[0].cpu().numpy()
         r["obj_points"] = (obj_pts @ Ro.T + po).cpu().numpy()
         return r
 
-    out_dir = Path(args.output_dir or (REPO_ROOT / "outputs/grasp_score" / args.object_name / args.task_name))
+    out_dir = Path(args.output_dir or (REPO_ROOT / "outputs/grasp_score" / Path(args.grasp_ref).stem
+                                       / args.object_name / args.task_name))
     out_dir.mkdir(parents=True, exist_ok=True)
     all_scores = []
 
@@ -264,6 +272,9 @@ def main() -> None:
             step += 1
 
         goal_pct = 100.0 * goals_reached / n_goals
+        if series and args.save_ref and ep == 0:
+            torch.save(series[-1]["ref"], args.save_ref)
+            print(f"[grasp] saved reference {args.save_ref}: {series[-1]['ref']['ref']}")
         if series:
             keys = ["total", "f1", "f4p", "gate", "f4d", "share"]
             last = series[-1]
