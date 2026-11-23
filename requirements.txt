@@ -1,0 +1,10 @@
+torch>=2.0
+numpy
+scipy
+trimesh
+matplotlib
+# MANO hand (MANOHand)
+manotorch @ git+https://github.com/lixiny/manotorch.git
+chumpy
+# URDF dexterous hands (URDFHand), optional
+pytorch_kinematics
