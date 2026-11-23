@@ -27,7 +27,9 @@ class GraspScorer:
 
     def __init__(self, s_ref: HandState, sign_ref: float, ref_obj, ref_obj_n, ref_lab, vocab: List[str],
                  afford_parts: List[str], f1_loosen=1.5, gate_tau=0.4, gate_width=0.05, contact_term="dist",
-                 dist_delta=5000.0, dist_sigma=0.01, dist_clip=0.05, cfg: Optional[FactorConfig] = None, device="cpu"):
+                 dist_delta=5000.0, dist_sigma=0.01, dist_clip=0.05, cfg: Optional[FactorConfig] = None, device="cpu",
+                 chunk=64):
+        self.chunk = chunk
         self.cfg = cfg or FactorConfig()
         self.cfg.f1_temp *= f1_loosen
         self.vocab, self.device = list(vocab), device
@@ -39,13 +41,16 @@ class GraspScorer:
         self.P_ref, self.D_ref = P, D[:, :, self.aff].amin(-1).clamp(max=dist_clip)
 
     def _contact(self, s, obj, obj_n, lab):
-        obj = torch.as_tensor(obj, dtype=torch.float32, device=self.device).view(1, -1, 3)
-        obj_n = torch.as_tensor(obj_n, dtype=torch.float32, device=self.device).view(1, -1, 3)
+        obj = torch.as_tensor(obj, dtype=torch.float32, device=self.device)
+        obj_n = torch.as_tensor(obj_n, dtype=torch.float32, device=self.device)
+        if obj.dim() == 2:
+            obj, obj_n = obj[None], obj_n[None]
         onehot = torch.nn.functional.one_hot(torch.as_tensor(lab, device=self.device).long(), len(self.vocab)).float()
-        return part_shares(s, obj, obj_n, onehot, self.cfg)
+        return part_shares(s, obj, obj_n, onehot, self.cfg, chunk=self.chunk)
 
     def score(self, s: HandState, sign: float, obj, obj_n, lab):
-        """s: batch of candidate hands on one object (points (M,3), normals (M,3), part labels (M,) in vocab)."""
+        """s: batch of candidate hands; object points / normals (M,3) or per candidate (B,M,3), part labels (M,) or
+        (B,M) as indices into self.vocab."""
         B = s.points.shape[0]
         f1 = f1_shape(s, expand(self.s_ref, B), sign, self.sign_ref, self.cfg)
         P, _, D, _ = self._contact(s, obj, obj_n, lab)

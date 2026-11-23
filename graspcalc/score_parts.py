@@ -94,24 +94,27 @@ def index(s: HandState, i):
 
 def part_shares(s, obj, obj_n, onehot, cfg, chunk=64):
     """returns P (B, 16, n_obj_parts) contact shares, the scalar object contact map (B, M), D (B, 16, n_obj_parts)
-    distance from each hand part to each object part, and pen (B) the deepest object point inside the hand."""
+    distance from each hand part to each object part, and pen (B) the deepest object point inside the hand.
+    obj / obj_n are (1, M, 3) or per-candidate (B, M, 3); onehot is (M, P) or (B, M, P)."""
     Ps, ocs, Ds, pens = [], [], [], []
-    in_part = onehot.bool()
+    per_obj = obj.shape[0] > 1
     for i in range(0, s.points.shape[0], chunk):
         si = index(s, slice(i, i + chunk))
-        _, oc, og = contact_maps(si, obj, obj_n, cfg)
-        A = og @ onehot
+        b = si.points.shape[0]
+        oi, ni = (obj[i:i + b], obj_n[i:i + b]) if per_obj else (obj, obj_n)
+        oh = onehot[i:i + b] if onehot.dim() == 3 else onehot
+        _, oc, og = contact_maps(si, oi, ni, cfg)
+        A = og @ oh
         Ps.append(A / A.sum((1, 2), keepdim=True).clamp_min(1e-9))
         ocs.append(oc)
-        b = si.points.shape[0]
-        o = obj.expand(b, -1, -1)
+        o = oi.expand(b, -1, -1)
         d = torch.cdist(o, si.points)  # b, M, N
         pid = si.part_ids.to(d.device)
         dh = torch.full((b, d.shape[1], len(PARTS)), float("inf"), device=d.device).scatter_reduce(
             2, pid.view(1, 1, -1).expand_as(d), d, "amin")  # b, M, 16
-        Ds.append(torch.stack([dh[:, in_part[:, p]].amin(1) if in_part[:, p].any() else
-                               torch.full((b, len(PARTS)), float("inf"), device=d.device)
-                               for p in range(onehot.shape[1])], -1))
+        mask = oh.bool().expand(b, -1, -1)  # b, M, P
+        Ds.append(torch.where(mask[:, :, None, :], dh[..., None], torch.full_like(dh[..., None], float("inf")))
+                  .amin(1))  # b, 16, P
         if si.normals is None:
             pens.append(torch.zeros(b, device=d.device))
         else:
