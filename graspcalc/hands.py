@@ -53,6 +53,7 @@ def vertex_normals(verts, faces):
 
 class HandModel:
     name = "hand"
+    side = "right"
     palm_normal_sign = 1.0  # flips palm-frame z so that +z points out of the palm (towards the object)
 
     def __call__(self, **params) -> HandState:
@@ -78,7 +79,8 @@ class MANOHand(HandModel):
                 setattr(np, k, v)
         from manotorch.manolayer import ManoLayer
         self.layer = ManoLayer(center_idx=0, mano_assets_root=mano_root, side=side).to(device)
-        self.device = device
+        self.device, self.side = device, side
+        self.palm_normal_sign = 1.0 if side == "right" else -1.0
         joint_of_vert = self.layer.th_weights.argmax(1).cpu().tolist()
         self.part_ids = torch.tensor([PARTS.index(_MANO16_PART[j]) for j in joint_of_vert])
         self.faces = self.layer.th_faces
@@ -96,12 +98,12 @@ class MANOHand(HandModel):
 
 @dataclass
 class URDFHandConfig:
-    """Mapping from a robot hand's URDF to the shared vocabulary.
-
+    """Maps a URDF hand onto the shared hand interface.
     link_parts:    link name -> part in PARTS (links not listed are ignored, e.g. mounting flanges)
-    finger_chains: finger name (subset of FINGERS) -> link names from finger base to distal link
-    tip_offsets:   finger -> xyz offset of the fingertip in the distal link frame
+    finger_chains: finger name (subset of FINGERS) -> link names whose origins are the keypoints, base ... tip
+    tip_offsets:   finger -> xyz offset of an extra fingertip keypoint in the last chain link's frame
     wrist_link:    link whose origin is used as the wrist
+    side:          "left" or "right"; the palm frame of a left hand is mirrored, so its palm_normal_sign is negated
     """
     urdf_path: str
     link_parts: Dict[str, str]
@@ -109,65 +111,152 @@ class URDFHandConfig:
     wrist_link: str
     tip_offsets: Dict[str, List[float]] = field(default_factory=dict)
     points_per_link: int = 128
+    side: str = "right"
     palm_normal_sign: float = 1.0
+    joint_names: Optional[List[str]] = None  # order of q; default = URDF order of the movable joints
+
+
+def _rpy_matrix(r, p, y):
+    cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+    return np.array([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                     [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                     [-sp, cp * sr, cp * cr]])
+
+
+def _origin(el):
+    T = np.eye(4)
+    o = el.find("origin") if el is not None else None
+    if o is not None:
+        T[:3, :3] = _rpy_matrix(*[float(v) for v in o.get("rpy", "0 0 0").split()])
+        T[:3, 3] = [float(v) for v in o.get("xyz", "0 0 0").split()]
+    return T
+
+
+def _axis_angle(axis, q):
+    """axis: 3, q: B -> B,3,3 (Rodrigues)."""
+    K = torch.zeros(3, 3, dtype=q.dtype, device=q.device)
+    K[0, 1], K[0, 2], K[1, 0], K[1, 2], K[2, 0], K[2, 1] = -axis[2], axis[1], axis[2], -axis[0], -axis[1], axis[0]
+    s, c = torch.sin(q)[:, None, None], torch.cos(q)[:, None, None]
+    return torch.eye(3, dtype=q.dtype, device=q.device) + s * K + (1 - c) * (K @ K)
 
 
 class URDFHand(HandModel):
-    """Generic URDF hand via pytorch_kinematics. Not yet validated on a real robot hand."""
+    """Any URDF hand. Surface points are sampled per link (collision mesh, else visual mesh) and moved either by
+    the built-in differentiable forward kinematics (__call__) or by link poses read from a simulator
+    (from_link_poses), so the same scorer runs offline and inside Isaac Lab / MuJoCo."""
 
     def __init__(self, cfg: URDFHandConfig, device="cpu"):
         import os
-        import pytorch_kinematics as pk
+        import xml.etree.ElementTree as ET
         import trimesh
-        self.cfg = cfg
+        self.cfg, self.device, self.side = cfg, device, cfg.side
         self.name = os.path.splitext(os.path.basename(cfg.urdf_path))[0]
-        self.palm_normal_sign = cfg.palm_normal_sign
-        self.chain = pk.build_chain_from_urdf(open(cfg.urdf_path, "rb").read()).to(device=device)
-        root = os.path.dirname(cfg.urdf_path)
-        pts, pids, links = [], [], []
-        for frame_name in self.chain.get_frame_names():
-            link = self.chain.find_frame(frame_name).link
-            if link.name not in cfg.link_parts:
-                continue
-            for vis in link.visuals:
-                if vis.geom_type != "mesh":
+        self.palm_normal_sign = cfg.palm_normal_sign * (-1.0 if cfg.side == "left" else 1.0)
+        root_dir = os.path.dirname(cfg.urdf_path)
+        robot = ET.parse(cfg.urdf_path).getroot()
+        links = {l.get("name"): l for l in robot.findall("link")}
+        self.joints = []  # (name, type, parent, child, T_origin, axis)
+        self.limits = {}
+        for j in robot.findall("joint"):
+            ax = j.find("axis")
+            axis = [float(v) for v in ax.get("xyz").split()] if ax is not None else [1.0, 0.0, 0.0]
+            lim = j.find("limit")
+            if j.get("type") != "fixed":
+                self.limits[j.get("name")] = (float(lim.get("lower", -np.pi)), float(lim.get("upper", np.pi))) \
+                    if lim is not None else (-np.pi, np.pi)
+            self.joints.append((j.get("name"), j.get("type"), j.find("parent").get("link"), j.find("child").get("link"),
+                                torch.tensor(_origin(j), dtype=torch.float32, device=device),
+                                torch.tensor(axis, dtype=torch.float32, device=device)))
+        children = {c for _, _, _, c, _, _ in self.joints}
+        self.root_link = next(n for n in links if n not in children)
+        order, frontier = [], [self.root_link]  # joints in topological order
+        while frontier:
+            p = frontier.pop(0)
+            for jt in self.joints:
+                if jt[2] == p:
+                    order.append(jt)
+                    frontier.append(jt[3])
+        self.joints = order
+        movable = [jt[0] for jt in self.joints if jt[1] in ("revolute", "continuous", "prismatic")]
+        self.joint_names = cfg.joint_names or movable
+        self.q_lower = torch.tensor([self.limits[n][0] for n in self.joint_names], device=device)
+        self.q_upper = torch.tensor([self.limits[n][1] for n in self.joint_names], device=device)
+        pts, pids, plinks = [], [], []
+        for lname, part in cfg.link_parts.items():
+            el = links[lname]
+            geoms = el.findall("collision") or el.findall("visual")
+            for g in geoms:
+                m = g.find("geometry/mesh")
+                if m is None:
                     continue
-                fname, scale = vis.geom_param[0], vis.geom_param[1]
-                fname = fname.replace("package://", "")
-                mesh = trimesh.load(os.path.join(root, fname), force="mesh")
-                if scale is not None:
-                    mesh.apply_scale(np.asarray(scale))
-                p, _ = trimesh.sample.sample_surface(mesh, cfg.points_per_link, seed=0)
-                p = vis.offset.transform_points(torch.tensor(p, dtype=torch.float32, device=device))
-                pts.append(p)
-                pids += [PARTS.index(cfg.link_parts[link.name])] * len(p)
-                links += [link.name] * len(p)
-        self.local_points = torch.cat(pts)
+                fname = m.get("filename").replace("package://", "")
+                path = os.path.join(root_dir, fname)
+                if not os.path.exists(path):  # package://<pkg>/meshes/... -> meshes/...
+                    path = os.path.join(root_dir, *fname.split("/")[1:])
+                mesh = trimesh.load(path, force="mesh")
+                if m.get("scale"):
+                    mesh.apply_scale(np.array([float(v) for v in m.get("scale").split()]))
+                mesh.apply_transform(_origin(g))
+                p, _ = trimesh.sample.sample_surface_even(mesh, cfg.points_per_link, seed=0)
+                pts.append(torch.tensor(np.asarray(p), dtype=torch.float32))
+                pids += [PARTS.index(part)] * len(p)
+                plinks += [lname] * len(p)
+        self.local_points = torch.cat(pts).to(device)
         self.part_ids = torch.tensor(pids)
-        self.point_links = links
+        self.point_links = plinks
+        self.point_link_names = list(dict.fromkeys(plinks))
+        self.point_link_index = torch.tensor([self.point_link_names.index(l) for l in plinks], device=device)
+        self.keypoint_links = sorted({l for c in cfg.finger_chains.values() for l in c} | {cfg.wrist_link})
+        self.required_links = sorted(set(self.point_link_names) | set(self.keypoint_links))
 
-    @torch.no_grad()
-    def __call__(self, q, root_rot=None, root_tsl=None) -> HandState:
-        """q: B, DoF joint angles; root_rot: B, 3, 3; root_tsl: B, 3 (hand base pose in object frame)."""
+    def fk(self, q, root_rot=None, root_tsl=None) -> Dict[str, torch.Tensor]:
+        """q: B, DoF (order self.joint_names) -> {link: B,4,4} in the frame given by root_rot / root_tsl."""
         B = q.shape[0]
-        tf = self.chain.forward_kinematics(q)
-        mats = {k: v.get_matrix() for k, v in tf.items()}  # B, 4, 4
-        R = root_rot if root_rot is not None else torch.eye(3).expand(B, 3, 3)
-        t = root_tsl if root_tsl is not None else torch.zeros(B, 3)
+        T0 = torch.eye(4, dtype=q.dtype, device=q.device).repeat(B, 1, 1)
+        if root_rot is not None:
+            T0[:, :3, :3] = root_rot
+        if root_tsl is not None:
+            T0[:, :3, 3] = root_tsl
+        T = {self.root_link: T0}
+        col = {n: i for i, n in enumerate(self.joint_names)}
+        for name, jtype, parent, child, To, axis in self.joints:
+            Tj = T[parent] @ To
+            if name in col and jtype in ("revolute", "continuous"):
+                M = torch.eye(4, dtype=q.dtype, device=q.device).repeat(B, 1, 1)
+                M[:, :3, :3] = _axis_angle(axis, q[:, col[name]])
+                Tj = Tj @ M
+            elif name in col and jtype == "prismatic":
+                M = torch.eye(4, dtype=q.dtype, device=q.device).repeat(B, 1, 1)
+                M[:, :3, 3] = axis * q[:, col[name], None]
+                Tj = Tj @ M
+            T[child] = Tj
+        return T
 
-        def to_obj(m, p):  # p: n,3 in link frame -> B,n,3 in object frame
-            p = p @ m[:, :3, :3].transpose(1, 2) + m[:, None, :3, 3]
-            return p @ R.transpose(1, 2) + t[:, None]
-
-        pts = torch.zeros(B, len(self.point_links), 3)
-        for name in set(self.point_links):
-            idx = [i for i, l in enumerate(self.point_links) if l == name]
-            pts[:, idx] = to_obj(mats[name], self.local_points[idx])
+    def from_link_poses(self, link_T: Dict[str, torch.Tensor]) -> HandState:
+        """link_T: {link: B,4,4} (e.g. built from simulator body poses); needs self.required_links."""
+        Ts = torch.stack([link_T[l] for l in self.point_link_names], 1)  # B,L,4,4
+        Tp = Ts[:, self.point_link_index]  # B,N,4,4
+        pts = (Tp[..., :3, :3] @ self.local_points[None, :, :, None])[..., 0] + Tp[..., :3, 3]
         fingers = {}
         for f, chain_links in self.cfg.finger_chains.items():
-            kps = [to_obj(mats[l], torch.zeros(1, 3))[:, 0] for l in chain_links]
-            off = torch.tensor(self.cfg.tip_offsets.get(f, [0.0, 0.0, 0.0]))[None]
-            kps.append(to_obj(mats[chain_links[-1]], off)[:, 0])
+            kps = [link_T[l][:, :3, 3] for l in chain_links]
+            if f in self.cfg.tip_offsets:
+                Tl = link_T[chain_links[-1]]
+                off = torch.tensor(self.cfg.tip_offsets[f], dtype=Tl.dtype, device=Tl.device)
+                kps.append(Tl[:, :3, :3] @ off + Tl[:, :3, 3])
             fingers[f] = torch.stack(kps, 1)
-        wrist = to_obj(mats[self.cfg.wrist_link], torch.zeros(1, 3))[:, 0]
-        return HandState(points=pts, part_ids=self.part_ids, wrist=wrist, fingers=fingers)
+        return HandState(points=pts, part_ids=self.part_ids, wrist=link_T[self.cfg.wrist_link][:, :3, 3],
+                         fingers=fingers)
+
+    def __call__(self, q, root_rot=None, root_tsl=None) -> HandState:
+        return self.from_link_poses(self.fk(q, root_rot, root_tsl))
+
+
+def mirror(s: HandState, axis: int = 0) -> HandState:
+    """Reflects a hand state through the plane normal to `axis` (a right-hand grasp becomes a left-hand grasp).
+    Distances to an object reflected the same way are unchanged; the palm frame of the result is left-handed."""
+    m = torch.ones(3, dtype=s.points.dtype, device=s.points.device)
+    m[axis] = -1
+    return HandState(points=s.points * m, part_ids=s.part_ids, wrist=s.wrist * m,
+                     fingers={k: v * m for k, v in s.fingers.items()},
+                     normals=None if s.normals is None else s.normals * m)
