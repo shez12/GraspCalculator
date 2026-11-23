@@ -115,6 +115,7 @@ F1 depends only on hand shape, not on the hand's global pose or the object, so i
 3. **Per-part shares**: `A[k, p] = Σ_{o∈part p} og[k, o]`, normalised as `P = A / ΣA`. This 16 × P matrix does not depend on the instance, so it can be compared across objects.
 4. **Affordance only** (`--afford_parts handle`): take `P[:, :, handle]`, renormalise it within the handle, and compare it with the reference by soft IoU, `Σmin / Σmax`. This measures which hand parts touch the handle and in what proportion. Contact on other parts is ignored.
    - **Share discount** (`--share_discount 1`, default on): the total is also multiplied by `discount = min(candidate share on the affordance / reference share, 1)`. Without it, a faint contact tail on the affordance (e.g. 0.04% of the contact, hand 36 mm from a trigger) is renormalised into a full distribution and can match the reference.
+   - **F4d distance profile** (`--contact_term dist`, after DCGrasp): replaces the share discount. For each of the 16 hand parts, `D[k]` = distance from the part to the nearest affordance point (nearest object point without `--afford_parts`), clipped at 5 cm. With `w[k] = max(exp(-δ Dr[k]²), exp(-δ Dc[k]²))`, δ = 5000 m⁻², `F4d = exp(-Σ w (Dc − Dr)² / Σ w / σ_d²)`, σ_d = 1 cm. Absolute distances are kept, so a finger 36 mm from the trigger is not mistaken for a 4 mm contact; a transferred copy keeps its distances, so it is not penalised for a lower share.
 5. **Without `--afford_parts`**:
    - `F4p = sqrt(F4p_a · F4p_b)`, where `F4p_a` is the soft IoU of the per-part shares and `F4p_b` the soft IoU of the full 16 × P matrix;
    - `--min_part_ratio` turns on a hard requirement (default 0, off): every part holding at least `--ref_part_min` of the reference contact must hold at least `ratio` × the reference share in the candidate, otherwise the total is 0.
@@ -123,7 +124,8 @@ F1 depends only on hand shape, not on the hand's global pose or the object, so i
 
 ```
 gate  = sigmoid((F4p - gate_tau) / gate_width)     # defaults 0.4 / 0.05
-total = F1 * gate * discount                         # discount = 1 unless --afford_parts and --share_discount 1
+total = F1 * gate * discount   # --contact_term share: discount = share discount (1 unless --afford_parts and --share_discount 1)
+                               # --contact_term dist:  discount = F4d
 ```
 
 - F4p decides whether the grasp is in the right place; F1 then ranks hand shape.
@@ -175,6 +177,9 @@ Run time on the development machine (GPU):
 | `--f1_loosen` | 1.5 | multiplier on the F1 tolerance |
 | `--gate_tau` / `--gate_width` | 0.4 / 0.05 | gate centre and width; `gate_tau ≤ 0` uses `sqrt(F1·F4p)` |
 | `--share_discount` | 1 | affordance mode: multiply by `min(candidate / reference affordance share, 1)`; 0 disables |
+| `--contact_term` | share | `share`: share discount; `dist`: multiply by F4d instead |
+| `--dist_delta` / `--dist_sigma` / `--dist_clip` | 5000 / 0.01 / 0.05 | F4d weight (m⁻²), tolerance (m), distance clip (m) |
+| `--penetration` | 0 | experimental, not evaluated: multiply by `exp(-(relu(pen − pen_tau)/pen_sigma)²)`, pen = deepest object point inside the hand (hand normals) |
 | `--ref_part_min` / `--min_part_ratio` | 0.10 / 0 | part-share hard requirement; off when ratio is 0 |
 | `--n_obj_pts` | 2048 | object sample points |
 | `--device` | cuda if available | cuda or cpu |
@@ -184,7 +189,7 @@ Run time on the development machine (GPU):
 
 | File | Content |
 |---|---|
-| `part_scores.json` | one record per grasp: `total`, `s1_shape` (F1), `s4p`, `s4p_a`, `s4p_b`, `gate`, `discount`, `part_share`, `intent`, `is_ref` |
+| `part_scores.json` | one record per grasp: `total`, `s1_shape` (F1), `s4p`, `s4p_a`, `s4p_b`, `gate`, `discount`, `f4d`, `pen_mm`, `s_pen`, `part_share`, `intent`, `is_ref` |
 | `retrieval.json` | per real reference: `top1`, `mean_rank`, `mean_n`, `ref_part_share` |
 | `meta.json` | run configuration, part vocabulary, skipped objects |
 | `viz_<obj_id>.png` | panel 1 is the reference (on its own object), then the best, median and worst grasp on this object. Object coloured by part, red = contact, hand coloured by part |
@@ -208,7 +213,7 @@ Speed (reference contact cached, MANO forward included):
 
 ## 8. Known issues
 
-- **The share discount favours grasps with more affordance contact.** A transferred copy whose affordance share dropped below the reference's is discounted, so cross-object retrieval falls for references with little affordance contact (e.g. trigger_sprayer, whose reference has 12% on the trigger). `--share_discount 0` turns it off.
+- **The share discount favours grasps with more affordance contact.** A transferred copy whose affordance share dropped below the reference's is discounted, so cross-object retrieval falls for references with little affordance contact (e.g. trigger_sprayer, whose reference has 12% on the trigger). `--share_discount 0` turns it off; `--contact_term dist` (F4d) avoids it.
 - **The reference must touch the affordance part.** If it does not, affordance-only mode falls back to ranking by F1 alone.
 - **Mug F4p sits near the gate centre.** It is around 0.4, so the gate is only 0.45–0.58. `--gate_tau 0.3` loosens it.
 - **`URDFHand` is untested on real robot hands.**

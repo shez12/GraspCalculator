@@ -27,6 +27,7 @@ class HandState:
     part_ids: torch.Tensor  # N (index into PARTS)
     wrist: torch.Tensor  # B, 3
     fingers: Dict[str, torch.Tensor]  # finger -> B, K, 3 (base ... tip)
+    normals: Optional[torch.Tensor] = None  # B, N, 3 outward surface normals (optional; enables the penetration term)
 
     @property
     def parts(self) -> List[str]:
@@ -35,6 +36,19 @@ class HandState:
     @property
     def groups(self) -> List[str]:
         return sorted({part_group(p) for p in self.parts}, key=GROUPS.index)
+
+
+def vertex_normals(verts, faces):
+    """Outward vertex normals of a closed, consistently wound mesh: B, N, 3."""
+    f = faces.long()
+    v0, v1, v2 = verts[:, f[:, 0]], verts[:, f[:, 1]], verts[:, f[:, 2]]
+    fn = torch.cross(v1 - v0, v2 - v0, dim=-1)
+    vn = torch.zeros_like(verts)
+    for i in range(3):
+        vn.index_add_(1, f[:, i], fn)
+    vn = torch.nn.functional.normalize(vn, dim=-1)
+    out = ((verts - verts.mean(1, keepdim=True)) * vn).sum(-1).mean(1)  # flip if the winding points inwards
+    return vn * torch.where(out < 0, -1.0, 1.0)[:, None, None]
 
 
 class HandModel:
@@ -76,7 +90,8 @@ class MANOHand(HandModel):
         verts = out.verts + tsl[:, None]
         joints = out.joints + tsl[:, None]
         return HandState(points=verts, part_ids=self.part_ids, wrist=joints[:, 0],
-                         fingers={f: joints[:, idx] for f, idx in _MANO21_CHAIN.items()})
+                         fingers={f: joints[:, idx] for f, idx in _MANO21_CHAIN.items()},
+                         normals=vertex_normals(verts, self.faces.to(verts.device)))
 
 
 @dataclass

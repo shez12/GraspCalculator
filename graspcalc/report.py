@@ -101,7 +101,10 @@ def method_page(pdf, runs):
         + ("无部件占比硬条件。" if m0["min_part_ratio"] <= 0 else
            f"硬条件：参考占比 ≥{m0['ref_part_min']} 的部件，候选占比 < {m0['min_part_ratio']} × 参考时记 0。"),
         *(["        只看 affordance 时再乘连续折扣 min(候选在 affordance 上的接触占比 / 参考的占比, 1)，"
-            "防止 affordance 上的微弱接触被归一化放大。"] if aff and m0.get("share_discount", 0) else []),
+            "防止 affordance 上的微弱接触被归一化放大。"] if aff and m0.get("share_discount", 0) and m0.get("contact_term", "share") == "share" else []),
+        *(["        F4d（距离画像）：16 个手部位到 affordance 最近点的距离 D，w = max(exp(−δDr²), exp(−δDc²))，"
+            f"F4d = exp(−Σw(Dc−Dr)²/Σw/σ²)，δ = {m0.get('dist_delta')}，σ = {m0.get('dist_sigma')} m；总分乘 F4d，代替占比折扣。"]
+          if m0.get("contact_term") == "dist" else []),
         "        不使用物体对称和镜像，左右手区分。",
         "",
         "参考（每个类别一个参考，给该类别所有实例上的所有抓取打分，意图不参与打分）：",

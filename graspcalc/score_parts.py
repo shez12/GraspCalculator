@@ -15,6 +15,11 @@ every object of the category.
     soft IoU of the 16 x K contact restricted to them (which hand parts touch the handle, renormalised).
     discount = min(candidate affordance share / reference affordance share, 1) (affordance mode, --share_discount 1):
     total = F1 * gate * discount, so a faint contact tail on the affordance cannot be renormalised into a full match.
+    --contact_term dist replaces the discount with F4d, a part-level Distance Profile (after DCGrasp): D[k] = distance
+    from hand part k to the nearest affordance (or object) point, w[k] = max(exp(-delta Dr^2), exp(-delta Dc^2)),
+    F4d = exp(-sum w (Dc - Dr)^2 / sum w / sigma_d^2).
+    --penetration 1 multiplies by exp(-(relu(pen - tau) / sigma)^2), pen = deepest object point inside the hand
+    (signed with the hand's outward normals, so it does not need watertight object meshes).
 """
 import argparse
 import glob
@@ -77,23 +82,45 @@ def load_obj_oakbase(shape_dir, oakbase, cat, oid, n_pts, tol=0.005):
 
 def expand(s: HandState, B):
     return HandState(points=s.points.expand(B, -1, -1), part_ids=s.part_ids, wrist=s.wrist.expand(B, -1),
-                     fingers={k: v.expand(B, -1, -1) for k, v in s.fingers.items()})
+                     fingers={k: v.expand(B, -1, -1) for k, v in s.fingers.items()},
+                     normals=None if s.normals is None else s.normals.expand(B, -1, -1))
 
 
 def index(s: HandState, i):
     return HandState(points=s.points[i], part_ids=s.part_ids, wrist=s.wrist[i],
-                     fingers={k: v[i] for k, v in s.fingers.items()})
+                     fingers={k: v[i] for k, v in s.fingers.items()},
+                     normals=None if s.normals is None else s.normals[i])
 
 
 def part_shares(s, obj, obj_n, onehot, cfg, chunk=64):
-    """returns P (B, 16, n_obj_parts) contact shares and the scalar object contact map (B, M)."""
-    Ps, ocs = [], []
+    """returns P (B, 16, n_obj_parts) contact shares, the scalar object contact map (B, M), D (B, 16, n_obj_parts)
+    distance from each hand part to each object part, and pen (B) the deepest object point inside the hand."""
+    Ps, ocs, Ds, pens = [], [], [], []
+    in_part = onehot.bool()
     for i in range(0, s.points.shape[0], chunk):
-        _, oc, og = contact_maps(index(s, slice(i, i + chunk)), obj, obj_n, cfg)
+        si = index(s, slice(i, i + chunk))
+        _, oc, og = contact_maps(si, obj, obj_n, cfg)
         A = og @ onehot
         Ps.append(A / A.sum((1, 2), keepdim=True).clamp_min(1e-9))
         ocs.append(oc)
-    return torch.cat(Ps), torch.cat(ocs)
+        b = si.points.shape[0]
+        o = obj.expand(b, -1, -1)
+        d = torch.cdist(o, si.points)  # b, M, N
+        pid = si.part_ids.to(d.device)
+        dh = torch.full((b, d.shape[1], len(PARTS)), float("inf"), device=d.device).scatter_reduce(
+            2, pid.view(1, 1, -1).expand_as(d), d, "amin")  # b, M, 16
+        Ds.append(torch.stack([dh[:, in_part[:, p]].amin(1) if in_part[:, p].any() else
+                               torch.full((b, len(PARTS)), float("inf"), device=d.device)
+                               for p in range(onehot.shape[1])], -1))
+        if si.normals is None:
+            pens.append(torch.zeros(b, device=d.device))
+        else:
+            dmin, nn = d.min(2)
+            h = torch.gather(si.points, 1, nn[..., None].expand(-1, -1, 3))
+            n = torch.gather(si.normals, 1, nn[..., None].expand(-1, -1, 3))
+            sd = ((o - h) * n).sum(-1)
+            pens.append(torch.where((sd < 0) & (dmin < 0.02), -sd, torch.zeros_like(sd)).amax(1))
+    return torch.cat(Ps), torch.cat(ocs), torch.cat(Ds), torch.cat(pens)
 
 
 def f4p(P, P_ref):
@@ -166,7 +193,7 @@ def main(a):
     for oid, d in data.items():
         onehot = torch.nn.functional.one_hot(torch.as_tensor(d["lab"]), len(vocab)).float().to(a.device)
         d["st"] = hand(stack("pose", d["gs"]), stack("shape", d["gs"]), stack("tsl", d["gs"]))
-        d["P"], d["oc"] = part_shares(d["st"], d["obj"].to(a.device), d["obj_n"].to(a.device), onehot, cfg)
+        d["P"], d["oc"], d["D"], d["pen"] = part_shares(d["st"], d["obj"].to(a.device), d["obj_n"].to(a.device), onehot, cfg)
 
     aff = [vocab.index(p) for p in a.afford_parts.split(",") if p in vocab] if a.afford_parts else []
     if a.afford_parts:
@@ -194,9 +221,20 @@ def main(a):
                 need[:, aff] = True
             ok = ((d["P"].sum(1) >= a.min_part_ratio * P_ref.sum(1)) | ~need).all(1).float()
             gate = gate * ok
-            disc = s4a if aff and a.share_discount else torch.ones_like(s1)
+            cols = aff if aff else list(range(len(vocab)))
+            Dc = d["D"][:, :, cols].amin(-1).clamp(max=a.dist_clip)
+            Dr = d_ref["D"][i_ref:i_ref + 1, :, cols].amin(-1).clamp(max=a.dist_clip)
+            w = torch.maximum(torch.exp(-a.dist_delta * Dr ** 2), torch.exp(-a.dist_delta * Dc ** 2))
+            f4d = torch.exp(-(w * (Dc - Dr) ** 2).sum(1) / w.sum(1).clamp_min(1e-9) / a.dist_sigma ** 2)
+            if a.contact_term == "dist":
+                disc = f4d
+            else:
+                disc = s4a if aff and a.share_discount else torch.ones_like(s1)
+            pen = d["pen"]
+            spen = torch.exp(-((pen - a.pen_tau).clamp_min(0) / a.pen_sigma) ** 2) if a.penetration else torch.ones_like(s1)
             out[oid] = dict(s1=s1.cpu(), s4=s4.cpu(), s4a=s4a.cpu(), s4b=s4b.cpu(), gate=gate.cpu(), ok=ok.cpu(),
-                            disc=disc.cpu(), total=(s1 * gate * disc).cpu())
+                            disc=disc.cpu(), f4d=f4d.cpu(), pen=pen.cpu(), spen=spen.cpu(),
+                            total=(s1 * gate * disc * spen).cpu())
         return out, i_ref
 
     # 1) one reference for the whole category
@@ -213,17 +251,18 @@ def main(a):
             is_ref = oid == ref_oid and i == i_ref
             rows.append(dict(obj_id=oid, obj=d["name"], gid=g["gid"], intent=g["intent"], is_ref=is_ref,
                              total=r["total"][i].item(), s1_shape=r["s1"][i].item(), s4p=r["s4"][i].item(),
-                             s4p_a=r["s4a"][i].item(), s4p_b=r["s4b"][i].item(), gate=r["gate"][i].item(), discount=r["disc"][i].item(), part_ok=bool(r["ok"][i]),
+                             s4p_a=r["s4a"][i].item(), s4p_b=r["s4b"][i].item(), gate=r["gate"][i].item(), discount=r["disc"][i].item(), f4d=r["f4d"][i].item(),
+                             pen_mm=r["pen"][i].item() * 1000, s_pen=r["spen"][i].item(), part_ok=bool(r["ok"][i]),
                              part_share={vocab[p]: v for p, v in enumerate(d["P"][i].sum(0).tolist())}))
             if not is_ref:
                 by_intent.setdefault(g["intent"], []).append(rows[-1]["total"])
         order = sorted(range(len(rows)), key=lambda i: -rows[i]["total"])
         print(f"\n=== {d['name']} ({oid})  n={len(rows)}  ref={ref_oid}/{ref_gid}  part-label p95 dist {d['lab_dist_mm']:.1f} mm")
-        print(f"{'gid':<12}{'intent':<10}{'total':>7}{'F1':>7}{'F4p':>7}{'F4p_a':>7}{'F4p_b':>7}{'gate':>7}{'disc':>7}  object-part share of contact")
+        print(f"{'gid':<12}{'intent':<10}{'total':>7}{'F1':>7}{'F4p':>7}{'F4p_a':>7}{'F4p_b':>7}{'gate':>7}{'disc':>7}{'F4d':>7}{'pen':>6}  object-part share of contact")
         for i in order:
             x = rows[i]
             print(f"{x['gid']:<12}{x['intent']:<10}{x['total']:>7.3f}{x['s1_shape']:>7.3f}{x['s4p']:>7.3f}"
-                  f"{x['s4p_a']:>7.3f}{x['s4p_b']:>7.3f}{x['gate']:>7.3f}{x['discount']:>7.3f}  {share(d['P'][i].cpu())}{'  <- ref' if x['is_ref'] else ''}")
+                  f"{x['s4p_a']:>7.3f}{x['s4p_b']:>7.3f}{x['gate']:>7.3f}{x['discount']:>7.3f}{x['f4d']:>7.3f}{x['pen_mm']:>6.1f}  {share(d['P'][i].cpu())}{'  <- ref' if x['is_ref'] else ''}")
         cand = [i for i in order if not rows[i]["is_ref"]]
         pick = [("best", cand[0]), ("median", cand[len(cand) // 2]), ("worst", cand[-1])]
         panels = [(f"REF {ref_oid}/{ref_gid} ({ref_g['intent']})\n{share(d_ref['P'][i_ref].cpu())}",
@@ -302,6 +341,14 @@ if __name__ == "__main__":
     ap.add_argument("--ref_part_min", type=float, default=0.10, help="parts with at least this share of the ref contact are required")
     ap.add_argument("--share_discount", type=int, default=1,
                     help="affordance mode: multiply by min(candidate / reference affordance share, 1); 0 disables")
+    ap.add_argument("--contact_term", choices=["share", "dist"], default="share",
+                    help="share: --share_discount; dist: multiply by the Distance-Profile factor F4d instead")
+    ap.add_argument("--dist_delta", type=float, default=5000.0, help="F4d weight exp(-delta d^2), 1/m^2")
+    ap.add_argument("--dist_sigma", type=float, default=0.01, help="F4d tolerance, m")
+    ap.add_argument("--dist_clip", type=float, default=0.05, help="distances are clipped at this value, m")
+    ap.add_argument("--penetration", type=int, default=0, help="1: multiply by the penetration factor")
+    ap.add_argument("--pen_tau", type=float, default=0.005, help="allowed penetration depth, m")
+    ap.add_argument("--pen_sigma", type=float, default=0.005, help="penetration tolerance beyond pen_tau, m")
     ap.add_argument("--min_part_ratio", type=float, default=0.0, help="candidate share on a required part >= ratio * ref share; 0 disables")
     ap.add_argument("--n_obj_pts", type=int, default=2048)
     ap.add_argument("--compare", default="", help="factor_scores.json of an older point-wise F4 run for the same category")
