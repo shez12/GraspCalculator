@@ -1,0 +1,235 @@
+diff --git a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py
+index 42c03361..de4b74c3 100644
+--- a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py
++++ b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py
+@@ -20,6 +20,7 @@ from .utils.obs_utils import (
+     compute_obs_dim,
+ )
+ from .utils.reset_utils import allocate_state_buffers, reset_env_state
++from .utils.grasp_score_utils import init_grasp_scorer
+ from .utils.reward_utils import compute_rewards
+ from .utils.scene_utils import apply_physx_material_properties, setup_scene
+ from .utils.termination_utils import compute_terminations, update_tolerance_curriculum
+@@ -42,6 +43,7 @@ class SimToolRealEnv(DirectRLEnv):
+         super().__init__(cfg, render_mode, **kwargs)  # runs _setup_scene
+         apply_physx_material_properties(self)
+         allocate_state_buffers(self)
++        init_grasp_scorer(self)
+ 
+     def _setup_scene(self) -> None:
+         setup_scene(self)
+diff --git a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
+index 892f03c4..0756d9ca 100644
+--- a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
++++ b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
+@@ -349,6 +349,14 @@ class RewardCfg:
+     kuka_actions_penalty_scale: float = 0.03
+     hand_actions_penalty_scale: float = 0.003
+ 
++    # Grasp-quality reward (graspcalculator), paid once when the object is first lifted. Off unless ref is set.
++    grasp_score_rew_scale: float = 0.0
++    grasp_score_ref: str = ""
++    grasp_score_afford_part: str = "grip"
++    graspcalc_root: str = "/home/szc/work/graspcalculator"
++    grasp_score_obj_pts: int = 1024
++    grasp_score_chunk: int = 16
++
+ 
+ # ----------------------------------------------------------------------------
+ # reset (includes goal sampling — both fire on _reset_idx)
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
+index f8c0ea5c..06efa597 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ 
+ import torch
+ 
++from .grasp_score_utils import grasp_score_reward
++
+ 
+ def lifting_reward(
+     object_z: torch.Tensor,            # (N,)
+@@ -104,6 +106,7 @@ def compute_rewards(env) -> torch.Tensor:
+         lifting_bonus=rew_cfg.lifting_bonus,
+         lifting_rew_scale=rew_cfg.lifting_rew_scale,
+     )
++    grasp_rew = grasp_score_reward(env, new_lifted & ~env._lifted_object)
+     env._lifted_object = new_lifted
+ 
+     ft_rew, new_closest_ft = distance_delta_reward(
+@@ -138,7 +141,7 @@ def compute_rewards(env) -> torch.Tensor:
+         force_consecutive=term_cfg.force_consecutive_near_goal_steps,
+     )
+ 
+-    reward = lift_rew + lift_bonus_rew + ft_rew + kp_rew + kuka_pen + hand_pen + bonus
++    reward = lift_rew + lift_bonus_rew + ft_rew + kp_rew + kuka_pen + hand_pen + bonus + grasp_rew
+     env._reward_terms = {
+         "fingertip_delta_rew": ft_rew,
+         "lifting_rew": lift_rew,
+@@ -147,6 +150,8 @@ def compute_rewards(env) -> torch.Tensor:
+         "kuka_actions_penalty": kuka_pen,
+         "hand_actions_penalty": hand_pen,
+         "bonus_rew": bonus,
++        "grasp_score_rew": grasp_rew,
++        **env._grasp_terms,
+         "total_reward": reward,
+     }
+ 
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/grasp_score_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/grasp_score_utils.py
+new file mode 100644
+index 00000000..c45fd89a
+--- /dev/null
++++ b/isaacsimenvs/tasks/simtoolreal/utils/grasp_score_utils.py
+@@ -0,0 +1,151 @@
++"""Grasp-quality reward from graspcalculator (https://github.com/shez12/GraspCalculator).
++
++At the step an env first lifts its object, the left Sharpa hand (simulated link poses) is scored against a reference
++grasp: total = F1 (hand shape) x gate(F4p, which hand parts touch the affordance part) x F4d (hand-part distance
++profile to the affordance part). Reward = cfg.reward.grasp_score_rew_scale * total, paid once per lift.
++"""
++
++from __future__ import annotations
++
++import sys
++import xml.etree.ElementTree as ET
++from pathlib import Path
++
++import numpy as np
++import torch
++
++GRASP_TERMS = ("grasp_score", "grasp_f1", "grasp_f4p", "grasp_f4d", "grasp_scored")
++
++
++def _origin(el):
++    from scipy.spatial.transform import Rotation
++
++    T = np.eye(4)
++    o = el.find("origin")
++    if o is not None:
++        T[:3, :3] = Rotation.from_euler("xyz", [float(v) for v in o.get("rpy", "0 0 0").split()]).as_matrix()
++        T[:3, 3] = [float(v) for v in o.get("xyz", "0 0 0").split()]
++    return T
++
++
++def _object_points(urdf_path: str, n_pts: int, afford: int, other: int, seed: int = 0):
++    """Surface points / normals / part labels of an object URDF in its root-link frame.
++    Two primitive collisions (procedural handle + head) -> first = affordance part, second = other part;
++    meshes -> handle / head split along the principal axis; a single primitive -> all affordance part."""
++    import trimesh
++    from graspcalc.objects import axis_part_labels
++
++    root = ET.parse(urdf_path).getroot()
++    meshes, primitive = [], True
++    for c in root.iter("collision"):
++        g = c.find("geometry")
++        if g.find("box") is not None:
++            m = trimesh.creation.box(extents=[float(v) for v in g.find("box").get("size").split()])
++        elif g.find("cylinder") is not None:
++            cy = g.find("cylinder")
++            m = trimesh.creation.cylinder(radius=float(cy.get("radius")), height=float(cy.get("length")))
++        elif g.find("sphere") is not None:
++            m = trimesh.creation.icosphere(radius=float(g.find("sphere").get("radius")))
++        elif g.find("mesh") is not None:
++            me = g.find("mesh")
++            m = trimesh.load(str(Path(urdf_path).parent / me.get("filename")), force="mesh")
++            if me.get("scale"):
++                m.apply_scale([float(v) for v in me.get("scale").split()])
++            primitive = False
++        else:
++            continue
++        m.apply_transform(_origin(c))
++        meshes.append(m)
++    merged = trimesh.util.concatenate(meshes)
++    face_part = np.concatenate([np.full(len(m.faces), i) for i, m in enumerate(meshes)])
++    pts, fi = trimesh.sample.sample_surface(merged, n_pts, seed=seed)
++    nrm = merged.face_normals[fi]
++    if primitive and len(meshes) == 2:
++        lab = np.where(face_part[fi] == 0, afford, other)
++    elif primitive:
++        lab = np.full(n_pts, afford)
++    else:
++        lab = np.where(axis_part_labels(pts) == 1, other, afford)
++    return pts, nrm, lab
++
++
++def _quat_to_mat(q):  # (..., 4) wxyz -> (..., 3, 3)
++    w, x, y, z = q.unbind(-1)
++    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
++                        2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
++                        2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1).view(*q.shape[:-1], 3, 3)
++
++
++def init_grasp_scorer(env) -> None:
++    """Called once after allocate_state_buffers. No-op unless cfg.reward.grasp_score_ref is set."""
++    rew = env.cfg.reward
++    env._grasp_scorer = None
++    env._grasp_terms = {k: torch.zeros(env.num_envs, device=env.device) for k in GRASP_TERMS}
++    if not rew.grasp_score_ref:
++        return
++    sys.path.insert(0, rew.graspcalc_root)
++    from graspcalc.hands import URDFHand
++    from graspcalc.robots import sharpa_ha4
++    from graspcalc.scorer import GraspScorer
++
++    repo_root = Path(__file__).resolve().parents[4]
++    robot_urdf = Path(env.cfg.assets.robot_urdf)
++    robot_urdf = robot_urdf if robot_urdf.is_absolute() else repo_root / robot_urdf
++    env._grasp_hand = URDFHand(sharpa_ha4("left", urdf_path=str(robot_urdf)), device=env.device)
++    env._grasp_scorer = GraspScorer.from_file(rew.grasp_score_ref, [rew.grasp_score_afford_part], device=env.device,
++                                              chunk=rew.grasp_score_chunk)
++    vocab = env._grasp_scorer.vocab
++    afford = vocab.index(rew.grasp_score_afford_part)
++    other = next(i for i in range(len(vocab)) if i != afford)
++    P, N, L = [], [], []
++    for path in env._object_urdf_paths:
++        p, n, l = _object_points(path, rew.grasp_score_obj_pts, afford, other)
++        P.append(p), N.append(n), L.append(l)
++    env._grasp_obj_pts = torch.tensor(np.stack(P), dtype=torch.float32, device=env.device)
++    env._grasp_obj_nrm = torch.tensor(np.stack(N), dtype=torch.float32, device=env.device)
++    env._grasp_obj_lab = torch.tensor(np.stack(L), dtype=torch.long, device=env.device)
++    env._grasp_body_names = list(env.robot.body_names)
++    print(f"[grasp_score] reference {rew.grasp_score_ref} ({env._grasp_scorer.meta['ref']}), affordance "
++          f"'{rew.grasp_score_afford_part}', {len(P)} object assets, scale {rew.grasp_score_rew_scale}")
++
++
++def score_grasps(env, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
++    """Scores the current hand pose of env_ids against the reference."""
++    pos = env.robot.data.body_link_pos_w[env_ids]
++    rot = _quat_to_mat(env.robot.data.body_link_quat_w[env_ids])
++    B = len(env_ids)
++    link_T = {}
++    for i, name in enumerate(env._grasp_body_names):
++        T = torch.eye(4, device=env.device).repeat(B, 1, 1)
++        T[:, :3, :3], T[:, :3, 3] = rot[:, i], pos[:, i]
++        link_T[name] = T
++    hand = env._grasp_hand.from_link_poses(link_T)
++    asset = env._object_asset_index_per_env[env_ids]
++    Ro = _quat_to_mat(env.object.data.root_quat_w[env_ids])
++    po = env.object.data.root_pos_w[env_ids]
++    obj = torch.einsum("bij,bmj->bmi", Ro, env._grasp_obj_pts[asset]) + po[:, None]
++    obj_n = torch.einsum("bij,bmj->bmi", Ro, env._grasp_obj_nrm[asset])
++    with torch.no_grad():
++        return env._grasp_scorer.score(hand, env._grasp_hand.palm_normal_sign, obj, obj_n, env._grasp_obj_lab[asset])
++
++
++def grasp_score_reward(env, just_lifted: torch.Tensor) -> torch.Tensor:
++    """(N,) reward; also fills env._grasp_terms (raw score terms, non-zero only at the lift step)."""
++    for v in env._grasp_terms.values():
++        v.zero_()
++    rew = torch.zeros(env.num_envs, device=env.device)
++    if env._grasp_scorer is None:
++        return rew
++    ids = just_lifted.nonzero(as_tuple=False).squeeze(-1)
++    if len(ids) == 0:
++        return rew
++    r = score_grasps(env, ids)
++    for key, src in (("grasp_score", "total"), ("grasp_f1", "f1"), ("grasp_f4p", "f4p"), ("grasp_f4d", "f4d")):
++        env._grasp_terms[key][ids] = r[src]
++    env._grasp_terms["grasp_scored"][ids] = 1.0
++    env.extras["grasp_score_at_lift"] = float(r["total"].mean())
++    rew[ids] = env.cfg.reward.grasp_score_rew_scale * r["total"]
++    return rew
++
++
++__all__ = ["init_grasp_scorer", "score_grasps", "grasp_score_reward", "GRASP_TERMS"]
