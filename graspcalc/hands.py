@@ -232,8 +232,17 @@ class URDFHand(HandModel):
             T[child] = Tj
         return T
 
+    def fill_fixed_links(self, link_T: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Adds links a simulator merged away (fixed-joint children, e.g. pads / fingertip frames) from their parent."""
+        out = dict(link_T)
+        for name, jtype, parent, child, To, axis in self.joints:
+            if child not in out and jtype == "fixed" and parent in out:
+                out[child] = out[parent] @ To.to(out[parent])
+        return out
+
     def from_link_poses(self, link_T: Dict[str, torch.Tensor]) -> HandState:
         """link_T: {link: B,4,4} (e.g. built from simulator body poses); needs self.required_links."""
+        link_T = self.fill_fixed_links(link_T)
         Ts = torch.stack([link_T[l] for l in self.point_link_names], 1)  # B,L,4,4
         Tp = Ts[:, self.point_link_index]  # B,N,4,4
         pts = (Tp[..., :3, :3] @ self.local_points[None, :, :, None])[..., 0] + Tp[..., :3, 3]

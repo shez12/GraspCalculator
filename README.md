@@ -217,3 +217,16 @@ Speed (reference contact cached, MANO forward included):
 - **The reference must touch the affordance part.** If it does not, affordance-only mode falls back to ranking by F1 alone.
 - **Mug F4p sits near the gate centre.** It is around 0.4, so the gate is only 0.45–0.58. `--gate_tau 0.3` loosens it.
 - **`URDFHand` is untested on real robot hands.**
+
+## SimToolReal (Isaac Lab, left Sharpa HA4)
+
+1. Export a left-hand reference (the right-hand OakInk grasp and its object are mirrored through x = 0):
+   `python -m graspcalc.export_reference --cat hammer --ref C22001/109708ca1a --side left --out refs/hammer_C22001_109708ca1a_left.pt`
+2. Copy `integrations/simtoolreal_eval_grasp_score_isaacsim.py` to `<simtoolreal>/dextoolbench/eval_grasp_score_isaacsim.py` and run it from the simtoolreal root:
+   `OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD python dextoolbench/eval_grasp_score_isaacsim.py --object_category hammer --object_name claw_hammer --task_name swing_down --grasp_ref <ref.pt> --afford_part grip`
+   It runs the DexToolBench policy evaluation and scores every step of the first `--score_window` steps after the object is lifted (`total = F1 x gate(F4p) x F4d`).
+   Hand points come from the simulated link poses (`URDFHand.from_link_poses`); the robot URDF is used so links merged by `merge_fixed_joints` are recovered from fixed joints.
+   DexToolBench meshes have no part labels; `graspcalc.objects.axis_part_labels` splits them into handle / head along the principal axis.
+   Output: `outputs/grasp_score/<object>/<task>/grasp_scores.json` and `ep*_grasp.npz`.
+
+`graspcalc.robots.sharpa_ha4` holds the Sharpa link -> part map; `graspcalc.retarget.retarget` fits a URDF hand to a MANO grasp by keypoints (offline checks).

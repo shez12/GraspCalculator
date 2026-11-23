@@ -16,6 +16,15 @@ from .score_parts import expand, part_shares
 
 
 class GraspScorer:
+    @classmethod
+    def from_file(cls, path, afford_parts, device="cpu", **kw):
+        """Reference saved by graspcalc.export_reference."""
+        r = torch.load(path, map_location=device)
+        s_ref = HandState(points=r["points"], part_ids=r["part_ids"], wrist=r["wrist"], fingers=r["fingers"])
+        sc = cls(s_ref, r["sign"], r["obj"], r["obj_n"], r["lab"], r["vocab"], afford_parts, device=device, **kw)
+        sc.meta = {k: r[k] for k in ("ref", "cat", "side")}
+        return sc
+
     def __init__(self, s_ref: HandState, sign_ref: float, ref_obj, ref_obj_n, ref_lab, vocab: List[str],
                  afford_parts: List[str], f1_loosen=1.5, gate_tau=0.4, gate_width=0.05, contact_term="dist",
                  dist_delta=5000.0, dist_sigma=0.01, dist_clip=0.05, cfg: Optional[FactorConfig] = None, device="cpu"):
