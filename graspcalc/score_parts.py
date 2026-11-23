@@ -33,6 +33,15 @@ from .paths import MANO_ROOT, OAKBASE_DIR, SHAPE_DIR
 PART_COLORS = [(0.80, 0.80, 0.80), (0.55, 0.75, 1.0), (0.60, 0.92, 0.60), (1.0, 0.85, 0.45), (0.85, 0.65, 1.0)]
 
 
+OAKBASE_CAT = {"scissors": "scissor", "cameras": "camera", "fryingpan": "frying_pan", "gamecontroller": "game_controller",
+               "lotion_pump": "lotion_bottle", "squeezable": "squeeze_tube"}
+
+
+def oakbase_cat(oakbase, cat):
+    """OakInk-Shape and OakBase name a few categories differently (e.g. scissors / scissor)."""
+    return cat if os.path.isdir(os.path.join(oakbase, cat)) else OAKBASE_CAT.get(cat, cat)
+
+
 def part_labels(oakbase, cat, name, pts):
     names, clouds = [], []
     for j in sorted(glob.glob(os.path.join(oakbase, cat, name, "part_*.json"))):
@@ -135,14 +144,15 @@ def main(a):
     out_dir = a.out_dir or f"out_parts_{a.cat}"
     os.makedirs(out_dir, exist_ok=True)
 
+    ob_cat = oakbase_cat(a.oakbase, a.cat)
     vocab, data = [], {}
     for oid in objs:
-        loaded = load_obj_oakbase(a.shape_dir, a.oakbase, a.cat, oid, a.n_obj_pts)
+        loaded = load_obj_oakbase(a.shape_dir, a.oakbase, ob_cat, oid, a.n_obj_pts)
         if loaded is None:
             print(f"[skip] {oid}: no OakBase parts")
             continue
         obj, obj_n, name = loaded
-        names, lab, dist = part_labels(a.oakbase, a.cat, name, obj[0].numpy())
+        names, lab, dist = part_labels(a.oakbase, ob_cat, name, obj[0].numpy())
         for n in names:
             if n not in vocab:
                 vocab.append(n)
@@ -248,7 +258,10 @@ def main(a):
                          ref_part_share={vocab[p]: v for p, v in enumerate(data[real_oid]["P"][i_r].sum(0).tolist())}))
         print(f"  {real_oid}/{g['gid']} ({g['intent']:<8}) on {len(hits):>2} objects: top-1 {np.mean(np.array(rk) == 1) * 100:5.1f}%  "
               f"mean rank {np.mean(rk):.2f} / mean n {np.mean(n):.1f}")
-    print(f"  overall: top-1 {np.mean(np.array(ranks) == 1) * 100:.1f}%  mean rank {np.mean(ranks):.2f}  ({len(ranks)} pairs)")
+    if not ranks:
+        print("  no transferred (virtual) grasps in this category")
+    else:
+        print(f"  overall: top-1 {np.mean(np.array(ranks) == 1) * 100:.1f}%  mean rank {np.mean(ranks):.2f}  ({len(ranks)} pairs)")
     json.dump(retr, open(os.path.join(out_dir, "retrieval.json"), "w"), indent=1)
     skipped = [o for o in dict.fromkeys(g["obj_id"] for g in all_grasps) if o not in data]
     json.dump(dict(vars(a), parts=vocab, n_objects=len(data), n_grasps=len(grasps), skipped=skipped),
