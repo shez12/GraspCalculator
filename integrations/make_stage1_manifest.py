@@ -41,9 +41,11 @@ def main() -> None:
 
     full_m = json.loads(Path(args.full_manifest).read_text())
     ref_idx = json.loads(Path(args.ref_index).read_text()) if Path(args.ref_index).exists() else {}
-    clouds = torch.load(full_m["pointcloud_cache"], map_location="cpu")
+    clouds_key = "clouds_pt" if "clouds_pt" in full_m else "pointcloud_cache"
+    clouds = torch.load(full_m[clouds_key], map_location="cpu")
 
     assets = full_m["assets"]
+    n_total = len(assets)
     by_cat: dict[str, list[int]] = {}
     for i, a in enumerate(assets):
         by_cat.setdefault(a["category"], []).append(i)
@@ -51,7 +53,7 @@ def main() -> None:
     chosen_indices: list[int] = []
     chosen_assets: list[dict] = []
     categories = sorted(by_cat.keys())
-    for cat in categories:
+    for cid, cat in enumerate(categories):
         ref_obj = None
         if cat in ref_idx:
             ref_entry = ref_idx[cat]
@@ -64,19 +66,23 @@ def main() -> None:
                     pick = idx
                     break
         chosen_indices.append(pick)
-        chosen_assets.append(assets[pick])
+        asset_copy = dict(assets[pick])
+        asset_copy["category_id"] = cid
+        chosen_assets.append(asset_copy)
 
     idx_t = torch.tensor(chosen_indices, dtype=torch.long)
-    sub_clouds = {
-        "points": clouds["points"][idx_t],
-        "afford_mask": clouds["afford_mask"][idx_t],
-        "asset_ids": [clouds["asset_ids"][i] for i in chosen_indices],
-        "categories": categories,
-        "category_ids": torch.arange(len(categories), dtype=torch.long),
-    }
-    for extra_k in ("normals", "part_ids", "scales"):
-        if extra_k in clouds and torch.is_tensor(clouds[extra_k]) and clouds[extra_k].shape[0] == len(assets):
-            sub_clouds[extra_k] = clouds[extra_k][idx_t]
+    sub_clouds: dict = {}
+    for k, v in clouds.items():
+        if k == "categories":
+            sub_clouds[k] = categories
+        elif k in ("category_id", "category_ids"):
+            sub_clouds[k] = torch.arange(len(categories), dtype=torch.long)
+        elif torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == n_total:
+            sub_clouds[k] = v[idx_t].clone()
+        elif isinstance(v, list) and len(v) == n_total:
+            sub_clouds[k] = [v[i] for i in chosen_indices]
+        else:
+            sub_clouds[k] = v
 
     out_clouds = Path(args.out_clouds).resolve()
     out_manifest = Path(args.out_manifest).resolve()
@@ -86,7 +92,9 @@ def main() -> None:
     torch.save(sub_clouds, out_clouds)
     sub_manifest = dict(full_m)
     sub_manifest["assets"] = chosen_assets
-    sub_manifest["pointcloud_cache"] = str(out_clouds)
+    sub_manifest["categories"] = categories
+    sub_manifest["num_assets"] = len(chosen_assets)
+    sub_manifest[clouds_key] = str(out_clouds)
     out_manifest.write_text(json.dumps(sub_manifest, indent=2))
 
     print(f"Wrote {len(chosen_assets)} assets ({len(categories)} categories) -> {out_manifest}")
