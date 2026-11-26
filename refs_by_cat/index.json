@@ -1,0 +1,122 @@
+{
+  "flashlight": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/flashlight.pt",
+    "ref": "C23001/f744dd2334",
+    "intent": "use",
+    "afford_parts_orig": [
+      "handle"
+    ],
+    "near_aff_15mm": 0.503,
+    "num_candidates": 4
+  },
+  "fryingpan": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/fryingpan.pt",
+    "ref": "C26001/2796f49dc4",
+    "intent": "use",
+    "afford_parts_orig": [
+      "pan_handle"
+    ],
+    "near_aff_15mm": 0.406,
+    "num_candidates": 4
+  },
+  "hammer": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/hammer.pt",
+    "ref": "C22001/dc2a761e0b",
+    "intent": "use",
+    "afford_parts_orig": [
+      "grip"
+    ],
+    "near_aff_15mm": 0.656,
+    "num_candidates": 4
+  },
+  "knife": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/knife.pt",
+    "ref": "S20022/fe8626ce73",
+    "intent": "use",
+    "afford_parts_orig": [
+      "handle"
+    ],
+    "near_aff_15mm": 0.618,
+    "num_candidates": 18
+  },
+  "pen": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/pen.pt",
+    "ref": "Y29040/a13a9470bc",
+    "intent": "use",
+    "afford_parts_orig": [
+      "pen_body"
+    ],
+    "near_aff_15mm": 0.179,
+    "num_candidates": 4
+  },
+  "pincer": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/pincer.pt",
+    "ref": "O36002/73627d6592",
+    "intent": "use",
+    "afford_parts_orig": [
+      "handle"
+    ],
+    "near_aff_15mm": 0.465,
+    "num_candidates": 4
+  },
+  "power_drill": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/power_drill.pt",
+    "ref": "Y27035/c1fe651be4",
+    "intent": "use",
+    "afford_parts_orig": [
+      "drill_grip"
+    ],
+    "near_aff_15mm": 0.685,
+    "num_candidates": 3
+  },
+  "scissors": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/scissors.pt",
+    "ref": "Y35037/66b57086b8",
+    "intent": "use",
+    "afford_parts_orig": [
+      "handle"
+    ],
+    "near_aff_15mm": 0.364,
+    "num_candidates": 4
+  },
+  "screwdriver": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/screwdriver.pt",
+    "ref": "O21001/7c95aabef1",
+    "intent": "use",
+    "afford_parts_orig": [
+      "handle"
+    ],
+    "near_aff_15mm": 0.541,
+    "num_candidates": 4
+  },
+  "toothbrush": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/toothbrush.pt",
+    "ref": "C25001/c1b9a61538",
+    "intent": "use",
+    "afford_parts_orig": [
+      "brush_handle"
+    ],
+    "near_aff_15mm": 0.416,
+    "num_candidates": 8
+  },
+  "trigger_sprayer": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/trigger_sprayer.pt",
+    "ref": "A01006/3192c41acf",
+    "intent": "use",
+    "afford_parts_orig": [
+      "bottle_body"
+    ],
+    "near_aff_15mm": 0.46,
+    "num_candidates": 24
+  },
+  "wrench": {
+    "path": "/home/szc/work/graspcalculator/refs_by_cat/wrench.pt",
+    "ref": "O24001/b69e396d3d",
+    "intent": "use",
+    "afford_parts_orig": [
+      "handle"
+    ],
+    "near_aff_15mm": 0.551,
+    "num_candidates": 1
+  }
+}

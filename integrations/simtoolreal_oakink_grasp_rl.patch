@@ -1,0 +1,2411 @@
+diff --git a/dextoolbench/eval_grasp_score_isaacsim.py b/dextoolbench/eval_grasp_score_isaacsim.py
+new file mode 100644
+index 00000000..0b2e74fa
+--- /dev/null
++++ b/dextoolbench/eval_grasp_score_isaacsim.py
+@@ -0,0 +1,340 @@
++"""DexToolBench policy evaluation — Isaac Sim (Isaac Lab) backend.
++
++Clone of ``dextoolbench/eval_isaacgym.py`` (Isaac Gym) running on
++``Isaacsimenvs-SimToolReal-Direct-v0``. Loads a specific DexToolBench object
++URDF + task trajectory, rolls the policy for N episodes, and writes the same
++``eval.json`` schema (avg_goal_pct / avg_time_sec / per-episode lists).
++
++Run inside the Isaac Sim venv:
++
++    OMNI_KIT_ACCEPT_EULA=YES .venv_isaacsim/bin/python dextoolbench/eval_isaacsim.py \\
++        --object_category hammer \\
++        --object_name claw_hammer \\
++        --task_name swing_down \\
++        --config_path pretrained_policy/config.yaml \\
++        --checkpoint_path pretrained_policy/model.pth \\
++        --num_episodes 10 \\
++        --output_dir evals_isaacsim/hammer/claw_hammer/swing_down
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import tempfile
++from pathlib import Path
++
++from isaaclab.app import AppLauncher
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++CONTROL_HZ = 60.0
++
++TABLE_URDF = "assets/urdf/table_narrow.urdf"
++TABLE_WHITEBOARD_URDF = "assets/urdf/table_narrow_whiteboard.urdf"
++TABLE_NAIL_URDF = "assets/urdf/table_narrow_nail.urdf"
++TABLE_BOWL_PLATE_URDF = "assets/urdf/table_narrow_bowl_plate.urdf"
++
++OBJECT_CATEGORY_TO_TABLE_URDF = {
++    "hammer": TABLE_NAIL_URDF,
++    "spatula": TABLE_BOWL_PLATE_URDF,
++    "eraser": TABLE_WHITEBOARD_URDF,
++    "screwdriver": TABLE_URDF,
++    "marker": TABLE_WHITEBOARD_URDF,
++    "brush": TABLE_URDF,
++}
++
++
++def _build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--object_category", required=True)
++    parser.add_argument("--object_name", required=True)
++    parser.add_argument("--task_name", required=True)
++    parser.add_argument("--config_path", default=str(REPO_ROOT / "pretrained_policy/config.yaml"))
++    parser.add_argument("--checkpoint_path", default=str(REPO_ROOT / "pretrained_policy/model.pth"))
++    parser.add_argument("--output_dir", default=None)
++    parser.add_argument("--num_episodes", type=int, default=1)
++    parser.add_argument("--graspcalc_root", default="/home/szc/work/graspcalculator")
++    parser.add_argument("--grasp_ref", required=True, help="reference .pt from graspcalc.export_reference")
++    parser.add_argument("--afford_part", default="grip", help="reference part the policy should hold")
++    parser.add_argument("--score_window", type=int, default=30, help="steps after the first lift that are scored")
++    parser.add_argument("--save_ref", default="", help="save the grasp at the last scored step as a reference .pt")
++    parser.add_argument("--downsample_factor", type=int, default=1,
++                        help="Downsample factor for trajectory goals.")
++    parser.add_argument("--z_offset", type=float, default=0.03,
++                        help="Z offset added to start pose to avoid the table.")
++    parser.add_argument("--force_table_urdf", action=argparse.BooleanOptionalAction,
++                        default=True,
++                        help="Always use the default table URDF regardless of category.")
++    parser.add_argument("--rl_device", default="cuda")
++    parser.add_argument("--video", action="store_true", help="record ep*.mp4 from cfg.viewer camera")
++    parser.add_argument("--video_every", type=int, default=2, help="record every N policy steps")
++    return parser
++
++
++def _launch_app():
++    parser = _build_parser()
++    AppLauncher.add_app_launcher_args(parser)
++    args = parser.parse_args()
++    args.headless = True
++    if args.video:
++        args.enable_cameras = True
++    app = AppLauncher(args).app
++    return app, args
++
++
++_app, _args = _launch_app()
++
++
++def _write_isaac_trajectory(goals_xyzw: list[list[float]], out_dir: Path) -> str:
++    """Convert gym-format goals ([x,y,z,qx,qy,qz,qw] list) into the
++    fixed_trajectory_file format (pos (1,K,3), quat wxyz (1,K,4))."""
++    pos = [[g[:3] for g in goals_xyzw]]
++    quat_wxyz = [[[g[6], g[3], g[4], g[5]] for g in goals_xyzw]]
++    path = out_dir / "trajectory_isaac_format.json"
++    with open(path, "w") as f:
++        json.dump({"pos": pos, "quat_wxyz": quat_wxyz}, f)
++    return str(path)
++
++
++def main() -> None:
++    args = _args
++
++    import gymnasium as gym
++    import numpy as np
++    import torch
++
++    import isaacsimenvs  # noqa: F401  registers gym envs
++    from isaacsimenvs.tasks.simtoolreal.simtoolreal_env_cfg import SimToolRealEnvCfg
++    from deployment.rl_player import RlPlayer
++    from dextoolbench.objects import NAME_TO_OBJECT
++
++    # --- Object + trajectory ---
++    obj = NAME_TO_OBJECT[args.object_name]
++    trajectory_path = (
++        REPO_ROOT / "dextoolbench/trajectories" / args.object_category
++        / args.object_name / f"{args.task_name}.json"
++    )
++    assert trajectory_path.exists(), f"Trajectory file not found: {trajectory_path}"
++    with open(trajectory_path) as f:
++        traj_data = json.load(f)
++    traj_data["start_pose"][2] += args.z_offset
++    traj_data["goals"] = traj_data["goals"][:: args.downsample_factor]
++    n_goals = len(traj_data["goals"])
++
++    tmp_dir = Path(tempfile.mkdtemp(prefix="dextoolbench_eval_"))
++    traj_file = _write_isaac_trajectory(traj_data["goals"], tmp_dir)
++
++    table_urdf = TABLE_URDF if args.force_table_urdf else (
++        OBJECT_CATEGORY_TO_TABLE_URDF[args.object_category]
++    )
++
++    # --- Env config (mirrors dextoolbench/eval_isaacgym.py overrides) ---
++    cfg = SimToolRealEnvCfg()
++    cfg.scene.num_envs = 1
++
++    cfg.assets.object_urdf = str(obj.decomposed_urdf_path)
++    cfg.assets.object_scale = tuple(obj.scale)
++    cfg.assets.table_urdf = table_urdf
++
++    rs = cfg.reset
++    rs.reset_position_noise_x = 0.0
++    rs.reset_position_noise_y = 0.0
++    rs.reset_position_noise_z = 0.0
++    rs.reset_dof_pos_random_interval_arm = 0.0
++    rs.reset_dof_pos_random_interval_fingers = 0.0
++    rs.reset_dof_vel_random_interval = 0.0
++    rs.table_reset_z = 0.38
++    rs.table_reset_z_range = 0.0
++    rs.start_arm_higher = True
++    # gym start_pose is (x,y,z, qx,qy,qz,qw); cfg wants (x,y,z, qw,qx,qy,qz).
++    sp = traj_data["start_pose"]
++    rs.fixed_start_pose = (sp[0], sp[1], sp[2], sp[6], sp[3], sp[4], sp[5])
++    rs.fixed_trajectory_file = traj_file
++
++    dr = cfg.domain_randomization
++    dr.use_obs_delay = False
++    dr.use_action_delay = False
++    dr.use_object_state_delay_noise = False
++    dr.object_scale_noise_multiplier_range = (1.0, 1.0)
++    dr.joint_velocity_obs_noise_std = 0.0
++    dr.force_scale = 0.0
++    dr.torque_scale = 0.0
++    dr.force_prob_range = (0.0001, 0.0001)
++    dr.torque_prob_range = (0.0001, 0.0001)
++
++    term = cfg.termination
++    term.eval_success_tolerance = 0.01
++    term.success_steps = 1
++    term.max_consecutive_successes = n_goals
++
++    env = gym.make("Isaacsimenvs-SimToolReal-Direct-v0", cfg=cfg, render_mode="rgb_array" if args.video else None)
++    inner = env.unwrapped
++    inner._replay_target_lab_order = None
++
++    n_act = cfg.action_space
++    player = RlPlayer(
++        num_observations=inner.cfg.observation_space,
++        num_actions=n_act,
++        config_path=args.config_path,
++        checkpoint_path=args.checkpoint_path,
++        device=args.rl_device,
++        num_envs=1,
++    )
++
++    # --- grasp scorer (graspcalculator) ---
++    import sys
++    import trimesh
++    sys.path.insert(0, args.graspcalc_root)
++    from graspcalc.hands import URDFHand
++    from graspcalc.objects import axis_part_labels
++    from graspcalc.robots import sharpa_ha4
++    from graspcalc.scorer import GraspScorer
++    dev = inner.device
++    # robot URDF itself, so links merged into the arm by merge_fixed_joints are recovered through fixed joints
++    hand = URDFHand(sharpa_ha4("left", urdf_path=str(REPO_ROOT / cfg.assets.robot_urdf)), device=dev)
++    scorer = GraspScorer.from_file(args.grasp_ref, [args.afford_part], device=dev)
++    mesh_path, mesh_scale = obj.get_object_mesh_path_and_scale()
++    mesh = trimesh.load(str(mesh_path), force="mesh")
++    mesh.apply_scale(mesh_scale)
++    op, fi = trimesh.sample.sample_surface_even(mesh, 2048, seed=0)
++    obj_pts = torch.tensor(np.asarray(op), dtype=torch.float32, device=dev)
++    obj_nrm = torch.tensor(mesh.face_normals[fi], dtype=torch.float32, device=dev)
++    head = axis_part_labels(op)
++    vocab = scorer.vocab
++    other = next(p for p in vocab if p != args.afford_part)
++    obj_lab = torch.tensor(np.where(head == 1, vocab.index(other), vocab.index(args.afford_part)), device=dev)
++    body_names = list(inner.robot.body_names)
++    body_idx = {n: i for i, n in enumerate(body_names)}
++
++    def quat_to_mat(q):  # wxyz -> 3x3
++        w, x, y, z = q.unbind(-1)
++        return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
++                            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
++                            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1).view(*q.shape[:-1], 3, 3)
++
++    def score_now():
++        pos, quat = inner.robot.data.body_link_pos_w[0:1], inner.robot.data.body_link_quat_w[0:1]
++        Rb = quat_to_mat(quat)
++        link_T = {}
++        for n, i in body_idx.items():
++            T = torch.eye(4, device=dev).repeat(1, 1, 1)
++            T[:, :3, :3], T[:, :3, 3] = Rb[:, i], pos[:, i]
++            link_T[n] = T
++        hs = hand.from_link_poses(link_T)
++        Ro = quat_to_mat(inner.object.data.root_quat_w[0])
++        po = inner.object.data.root_pos_w[0]
++        r = scorer.score(hs, hand.palm_normal_sign, obj_pts @ Ro.T + po, obj_nrm @ Ro.T, obj_lab)
++        r = {k: v[0].tolist() if v.dim() > 1 else float(v[0]) for k, v in r.items()}
++        if args.save_ref:
++            r["ref"] = dict(points=hs.points.cpu(), part_ids=hs.part_ids.cpu(), wrist=hs.wrist.cpu(),
++                            fingers={k: v.cpu() for k, v in hs.fingers.items()}, sign=hand.palm_normal_sign, side="left",
++                            obj=(obj_pts @ Ro.T + po).cpu(), obj_n=(obj_nrm @ Ro.T).cpu(), lab=obj_lab.cpu(),
++                            vocab=list(vocab), cat=args.object_category,
++                            ref=f"sim:{args.object_name}/{args.task_name}/ep{len(all_scores)}/lift+{args.score_window - 1}")
++        r["hand_points"] = hs.points[0].cpu().numpy()
++        r["obj_points"] = (obj_pts @ Ro.T + po).cpu().numpy()
++        return r
++
++    out_dir = Path(args.output_dir or (REPO_ROOT / "outputs/grasp_score" / Path(args.grasp_ref).stem
++                                       / args.object_name / args.task_name))
++    out_dir.mkdir(parents=True, exist_ok=True)
++    all_scores = []
++
++    episode_goal_pcts: list[float] = []
++    episode_lengths: list[int] = []
++
++    for ep in range(args.num_episodes):
++        player.player.init_rnn()
++        obs, _ = env.reset()
++        # Match gym driver's reset timing: one physics tick before the first
++        # policy action (gym's first step doubles as the reset trigger).
++        obs, _, _, _, _ = env.step(torch.zeros((1, n_act), device=inner.device))
++
++        step, done, goals_reached = 0, False, 0
++        lift_step, series, frames = None, [], []
++        # Loop on the env's own done signal only (matches eval_isaacgym.py and the
++        # interactive worker). episode_length_s is a PER-GOAL timeout that the env
++        # resets on each goal reached, so a multi-goal trajectory legitimately runs
++        # far longer than episode_length_s; a fixed max-step cap here would guillotine
++        # slow multi-goal tasks (e.g. flip_over) after the first goal's budget.
++        while not done:
++            policy_obs = obs["policy"].to(args.rl_device)
++            action = player.get_normalized_action(policy_obs, deterministic_actions=True)
++            obs, _, terminated, truncated, _ = env.step(action.to(inner.device))
++            done = bool(terminated[0].item() or truncated[0].item())
++            if args.video and step % args.video_every == 0:
++                frames.append(env.render())
++            if not done and lift_step is None and bool(inner._lifted_object[0].item()):
++                lift_step = step
++            if not done and lift_step is not None and step - lift_step < args.score_window:
++                series.append(score_now())
++            if done:
++                # step() already reset the env: the episode's final count was
++                # copied into _prev_episode_successes before _successes zeroed.
++                goals_reached = max(goals_reached, int(inner._prev_episode_successes[0].item()))
++            else:
++                goals_reached = max(goals_reached, int(inner._successes[0].item()))
++            step += 1
++
++        goal_pct = 100.0 * goals_reached / n_goals
++        if frames:
++            import imageio
++            imageio.mimsave(out_dir / f"ep{ep:02d}.mp4", frames, fps=30 // args.video_every * 2)
++            print(f"[video] wrote {out_dir / f'ep{ep:02d}.mp4'} ({len(frames)} frames)")
++        if series and args.save_ref and ep == 0:
++            torch.save(series[-1]["ref"], args.save_ref)
++            print(f"[grasp] saved reference {args.save_ref}: {series[-1]['ref']['ref']}")
++        if series:
++            keys = ["total", "f1", "f4p", "gate", "f4d", "share"]
++            last = series[-1]
++            summ = {k: float(np.mean([x[k] for x in series])) for k in keys}
++            print(f"[grasp] episode {ep + 1}: lifted at step {lift_step}; mean over {len(series)} steps " +
++                  " ".join(f"{k}={summ[k]:.3f}" for k in keys) + " | last " +
++                  " ".join(f"{k}={last[k]:.3f}" for k in keys) +
++                  " | hand-part->grip dist mm " + str([round(v * 1000) for v in last["dist"]]))
++            np.savez(out_dir / f"ep{ep:02d}_grasp.npz", hand_points=last["hand_points"], obj_points=last["obj_points"],
++                     obj_lab=obj_lab.cpu().numpy(), part_ids=hand.part_ids.numpy(),
++                     **{k: np.array([x[k] for x in series]) for k in keys})
++            all_scores.append(dict(episode=ep, lift_step=lift_step, goal_pct=goal_pct, mean=summ,
++                                   last={k: last[k] for k in keys}))
++        else:
++            print(f"[grasp] episode {ep + 1}: object never lifted")
++            all_scores.append(dict(episode=ep, lift_step=None, goal_pct=goal_pct))
++        json.dump(all_scores, open(out_dir / "grasp_scores.json", "w"), indent=1)
++        episode_goal_pcts.append(goal_pct)
++        episode_lengths.append(step)
++        print(f"[eval] episode {ep + 1}/{args.num_episodes}: "
++              f"{goals_reached}/{n_goals} goals ({goal_pct:.0f}%), "
++              f"{step / CONTROL_HZ:.1f}s")
++
++    avg_goal_pct = float(np.mean(episode_goal_pcts))
++    avg_time_sec = float(np.mean(episode_lengths) / CONTROL_HZ)
++    print(f"[eval] DONE: avg_goal_pct={avg_goal_pct:.1f}, avg_time_sec={avg_time_sec:.1f}")
++
++    if args.output_dir is not None:
++        output_dir = Path(args.output_dir)
++        output_dir.mkdir(parents=True, exist_ok=True)
++        with open(output_dir / "eval.json", "w") as f:
++            json.dump(
++                {
++                    "avg_goal_pct": avg_goal_pct,
++                    "avg_time_sec": avg_time_sec,
++                    "episode_goal_pcts": episode_goal_pcts,
++                    "episode_lengths": episode_lengths,
++                },
++                f,
++                indent=4,
++            )
++        print(f"[eval] wrote {output_dir / 'eval.json'}")
++
++    import os
++    import sys
++    # Skip Kit teardown (it hangs); os._exit makes cleanup moot.
++    sys.stdout.flush()
++    sys.stderr.flush()
++    os._exit(0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/isaacsimenvs/__init__.py b/isaacsimenvs/__init__.py
+index 14b12f4f..cd710ee9 100644
+--- a/isaacsimenvs/__init__.py
++++ b/isaacsimenvs/__init__.py
+@@ -7,5 +7,6 @@ any task id registered by isaacsimenvs is resolvable via ``gym.spec`` /
+ """
+ 
+ from . import tasks  # noqa: F401  side effect: gym.register(...) for each task
++from .utils import pointnet_network  # noqa: F401  side effect: register_network("pointnet_actor_critic")
+ 
+ __all__ = ["tasks"]
+diff --git a/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml b/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml
+new file mode 100644
+index 00000000..70f56277
+--- /dev/null
++++ b/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml
+@@ -0,0 +1,130 @@
++# SimToolReal end-to-end PointNet + LSTM + MLP SAPG training config.
++# Replaces bounding-box keypoints/scales with a 128-point object point cloud
++# (xyz_rel_palm + affordance_mask + goal_disp) encoded end-to-end by PointNet.
++
++params:
++  seed: 42
++
++  env:
++    clip_observations: 10.0
++    clip_actions: 1.0
++
++  algo:
++    name: a2c_continuous
++
++  model:
++    name: continuous_a2c_logstd
++
++  network:
++    name: pointnet_actor_critic
++    separate: False
++    pointnet:
++      num_points: 128
++      point_dim: 8
++      units: [64, 128, 128]
++      out_dim: 128
++    space:
++      continuous:
++        mu_activation: None
++        sigma_activation: None
++        mu_init:
++          name: default
++        sigma_init:
++          name: const_initializer
++          val: 0
++        fixed_sigma: coef_cond
++    mlp:
++      units: [1024, 1024, 512, 512]
++      activation: elu
++      d2rl: False
++      initializer:
++        name: default
++      regularizer:
++        name: None
++    rnn:
++      name: lstm
++      units: 1024
++      layers: 1
++      before_mlp: True
++      layer_norm: True
++
++  load_checkpoint: False
++  load_path: ''
++
++  config:
++    name: 0_simtoolreal_pointnet_sapg
++    full_experiment_name: ${.name}
++    env_name: rlgpu
++    device: 'cuda:0'
++    device_name: 'cuda:0'
++    multi_gpu: False
++    ppo: True
++    mixed_precision: True
++    normalize_input: False
++    normalize_value: True
++    value_bootstrap: True
++    normalize_advantage: True
++    reward_shaper:
++      scale_value: 0.01
++    num_actors: ${....env.scene.num_envs}
++    gamma: 0.99
++    tau: 0.95
++    learning_rate: 1e-4
++    lr_schedule: adaptive
++    schedule_type: standard
++    kl_threshold: 0.016
++    score_to_win: 1000000
++    max_epochs: 1000000
++    save_best_after: 100
++    save_frequency: 3000
++    print_stats: True
++    grad_norm: 1.0
++    entropy_coef: 0.0
++    truncate_grads: True
++    e_clip: 0.1
++    minibatch_size: 32768
++    mini_epochs: 2
++    critic_coef: 4.0
++    clip_value: True
++    horizon_length: 16
++    seq_length: 16
++    bounds_loss_coef: 0.0001
++
++    central_value_config:
++      minibatch_size: 32768
++      mini_epochs: 2
++      learning_rate: 1e-4
++      kl_threshold: 0.016
++      clip_value: True
++      normalize_input: False
++      truncate_grads: True
++      network:
++        name: pointnet_actor_critic
++        central_value: True
++        pointnet:
++          num_points: 128
++          point_dim: 8
++          units: [64, 128, 128]
++          out_dim: 128
++        mlp:
++          units: [1024, 1024, 512, 512]
++          activation: elu
++          d2rl: False
++          initializer:
++            name: default
++          regularizer:
++            name: None
++
++    # === SAPG ===
++    use_others_experience: lf
++    off_policy_ratio: 1.0
++    expl_type: mixed_expl_learn_param
++    expl_reward_type: entropy
++    expl_reward_coef_embd_size: 32
++    expl_reward_coef_scale: 0.002
++    expl_coef_block_size: 1024
++
++    player:
++      deterministic: False
++      games_num: 100000
++      print_stats: False
+diff --git a/isaacsimenvs/play_video.py b/isaacsimenvs/play_video.py
+index 846ce696..2549c124 100644
+--- a/isaacsimenvs/play_video.py
++++ b/isaacsimenvs/play_video.py
+@@ -46,6 +46,15 @@ def main() -> None:
+         default=None,
+         help="Override env_cfg.peg_in_hole.goal_mode before instantiation (e.g. 'dense').",
+     )
++    parser.add_argument("--dataset_manifest", default="", help="Override env_cfg.assets.dataset_manifest")
++    parser.add_argument("--human_like_goals", action="store_true", help="Enable env_cfg.reset.human_like_goals")
++    parser.add_argument("--use_pointcloud_obs", action="store_true", help="Enable env_cfg.obs.use_pointcloud_obs")
++    parser.add_argument("--use_grasp_ref_feat", action="store_true", help="Enable env_cfg.obs.use_grasp_ref_feat")
++    parser.add_argument("--grasp_score_ref_dir", default="", help="Override env_cfg.reward.grasp_score_ref_dir")
++    parser.add_argument("--grasp_score_backend", default="invariant_v2", help="Override env_cfg.reward.grasp_score_backend")
++    parser.add_argument("--use_grasp_score_curriculum", action="store_true", help="Enable grasp-score-gated success in rollout")
++    parser.add_argument("--grasp_score_threshold", type=float, default=0.0, help="Initial grasp score threshold for gated success")
++    parser.add_argument("--clean_env", action="store_true", help="Disable obs/state noise, scaling, and post-grasp random forces/torques")
+     my_args = parser.parse_args()
+ 
+     from isaaclab.app import AppLauncher
+@@ -71,8 +80,51 @@ def main() -> None:
+     # step/reset semantics needed, and DirectRLEnv exposes .scene / .sim directly.
+     env_cfg = load_cfg_from_registry(my_args.task, "env_cfg_entry_point")
+     env_cfg.scene.num_envs = my_args.num_envs
++    # Shrink PhysX GPU buffer allocations for small-N rollout so video recording
++    # can coexist with a large training run on the same GPU without CUDA OOM.
++    if my_args.num_envs <= 16 and hasattr(env_cfg, "sim") and hasattr(env_cfg.sim, "physx"):
++        px = env_cfg.sim.physx
++        for attr, val in (
++            ("gpu_max_rigid_contact_count", 2**16),
++            ("gpu_max_rigid_patch_count", 2**14),
++            ("gpu_found_lost_pairs_capacity", 2**15),
++            ("gpu_found_lost_aggregate_pairs_capacity", 2**15),
++            ("gpu_total_aggregate_pairs_capacity", 2**15),
++            ("gpu_heap_capacity", 2**22),
++            ("gpu_temp_buffer_capacity", 2**21),
++            ("gpu_collision_stack_size", 2**22),
++        ):
++            if hasattr(px, attr):
++                setattr(px, attr, val)
+     if my_args.goal_mode is not None and hasattr(env_cfg, "peg_in_hole"):
+         env_cfg.peg_in_hole.goal_mode = my_args.goal_mode
++    if my_args.dataset_manifest:
++        env_cfg.assets.dataset_manifest = my_args.dataset_manifest
++    if my_args.human_like_goals:
++        env_cfg.reset.human_like_goals = True
++    if my_args.use_pointcloud_obs:
++        env_cfg.obs.use_pointcloud_obs = True
++    if my_args.use_grasp_ref_feat:
++        env_cfg.obs.use_grasp_ref_feat = True
++    if my_args.grasp_score_ref_dir:
++        env_cfg.reward.grasp_score_ref_dir = my_args.grasp_score_ref_dir
++        env_cfg.reward.grasp_score_backend = my_args.grasp_score_backend
++    if my_args.use_grasp_score_curriculum:
++        env_cfg.termination.use_grasp_score_curriculum = True
++        env_cfg.termination.success_tolerance = 0.075
++        env_cfg.termination.grasp_score_threshold_start = float(my_args.grasp_score_threshold)
++    if my_args.clean_env:
++        env_cfg.reset.human_like_scale_range = (1.0, 1.0)
++        dr = env_cfg.domain_randomization
++        dr.use_object_state_delay_noise = False
++        dr.object_state_xyz_noise_std = 0.0
++        dr.object_state_rotation_noise_degrees = 0.0
++        dr.object_scale_noise_multiplier_range = (1.0, 1.0)
++        dr.joint_velocity_obs_noise_std = 0.0
++        dr.force_scale = 0.0
++        dr.torque_scale = 0.0
++        dr.force_prob_range = (0.0, 0.0)
++        dr.torque_prob_range = (0.0, 0.0)
+ 
+     spec = gym.spec(my_args.task)
+     mod_name, cls_name = spec.entry_point.split(":")
+@@ -85,8 +137,8 @@ def main() -> None:
+     camera_cfg = CameraCfg(
+         prim_path="/World/RecordCamera",
+         update_period=0,
+-        height=1080,
+-        width=1920,
++        height=720,
++        width=1280,
+         data_types=["rgb"],
+         spawn=sim_utils.PinholeCameraCfg(
+             focal_length=24.0,
+@@ -105,8 +157,8 @@ def main() -> None:
+ 
+     # Aim the camera using the env cfg's recording pose (env-local frame).
+     env_origin = env.scene.env_origins[my_args.env_idx]
+-    eye = env_origin + torch.tensor(env_cfg.record_camera_eye, device=env.device)
+-    target = env_origin + torch.tensor(env_cfg.record_camera_target, device=env.device)
++    eye = env_origin + torch.tensor(getattr(env_cfg, "record_camera_eye", env_cfg.viewer.eye), device=env.device)
++    target = env_origin + torch.tensor(getattr(env_cfg, "record_camera_target", env_cfg.viewer.lookat), device=env.device)
+     camera.set_world_poses_from_view(eye.unsqueeze(0), target.unsqueeze(0))
+ 
+     # Step the sim once to flush the pose change through PhysX/Hydra so
+@@ -135,6 +187,8 @@ def main() -> None:
+ 
+     agent_cfg["params"]["config"]["device"] = my_args.rl_device
+     agent_cfg["params"]["config"]["device_name"] = my_args.rl_device
++    if "expl_coef_block_size" in agent_cfg["params"]["config"]:
++        agent_cfg["params"]["config"]["expl_coef_block_size"] = max(1, my_args.num_envs)
+ 
+     # --- Player ---
+     from rl_games.torch_runner import Runner
+@@ -147,6 +201,7 @@ def main() -> None:
+     # `has_batch_dimension` is only set inside `player.run()`, which we bypass.
+     # Our obs are always batched (num_envs, obs_dim), so set it explicitly.
+     player.has_batch_dimension = True
++    player.batch_size = my_args.num_envs
+     # Allocate LSTM hidden state (no-op for non-RNN models). Without this,
+     # `player.get_action` for an LSTM checkpoint crashes inside
+     # `network_builder.py` with `len(states)` on None.
+@@ -167,6 +222,11 @@ def main() -> None:
+     for step_i in range(my_args.steps):
+         action = player.get_action(obs, is_deterministic=my_args.deterministic)
+         obs, rew, dones, infos = player.env_step(wrapped, action)
++        if getattr(player, "is_rnn", False) and getattr(player, "states", None) is not None:
++            done_idx = dones.nonzero(as_tuple=False).squeeze(-1)
++            if done_idx.numel() > 0:
++                for s in player.states:
++                    s[:, done_idx, :] = 0.0
+ 
+         if step_i % capture_every == 0:
+             camera.update(capture_every * policy_dt)
+diff --git a/isaacsimenvs/tasks/simtoolreal/__init__.py b/isaacsimenvs/tasks/simtoolreal/__init__.py
+index 3b58178e..fb326049 100644
+--- a/isaacsimenvs/tasks/simtoolreal/__init__.py
++++ b/isaacsimenvs/tasks/simtoolreal/__init__.py
+@@ -33,5 +33,6 @@ gym.register(
+         "env_cfg_yaml_entry_point": str(_CFG_DIR / "task" / "SimToolReal.yaml"),
+         "rl_games_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealPPO.yaml"),
+         "rl_games_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealSAPG.yaml"),
++        "rl_games_pointnet_sapg_cfg_entry_point": str(_CFG_DIR / "train" / "SimToolRealPointNetSAPG.yaml"),
+     },
+ )
+diff --git a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py
+index 42c03361..00f4c367 100644
+--- a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py
++++ b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env.py
+@@ -20,6 +20,7 @@ from .utils.obs_utils import (
+     compute_obs_dim,
+ )
+ from .utils.reset_utils import allocate_state_buffers, reset_env_state
++from .utils.grasp_score_utils import init_grasp_scorer
+ from .utils.reward_utils import compute_rewards
+ from .utils.scene_utils import apply_physx_material_properties, setup_scene
+ from .utils.termination_utils import compute_terminations, update_tolerance_curriculum
+@@ -36,12 +37,21 @@ class SimToolRealEnv(DirectRLEnv):
+     ) -> None:
+         # Override obs/state space from configured field lists before
+         # DirectRLEnv / rl_games observes the configclass.
++        if getattr(cfg.obs, "use_pointcloud_obs", False):
++            drop = {"keypoints_rel_palm", "keypoints_rel_goal", "object_scales"}
++            extra_pre = ("grasp_ref_feat",) if getattr(cfg.obs, "use_grasp_ref_feat", False) else ()
++            cfg.obs.obs_list = tuple(f for f in cfg.obs.obs_list if f not in drop) + extra_pre + ("object_pointcloud",)
++            cfg.obs.state_list = tuple(f for f in cfg.obs.state_list if f not in drop) + extra_pre + ("object_pointcloud",)
++        elif getattr(cfg.obs, "use_grasp_ref_feat", False):
++            cfg.obs.obs_list = tuple(cfg.obs.obs_list) + ("grasp_ref_feat",)
++            cfg.obs.state_list = tuple(cfg.obs.state_list) + ("grasp_ref_feat",)
+         cfg.observation_space = compute_obs_dim(cfg.obs.obs_list)
+         cfg.state_space = compute_obs_dim(cfg.obs.state_list)
+ 
+         super().__init__(cfg, render_mode, **kwargs)  # runs _setup_scene
+         apply_physx_material_properties(self)
+         allocate_state_buffers(self)
++        init_grasp_scorer(self)
+ 
+     def _setup_scene(self) -> None:
+         setup_scene(self)
+diff --git a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
+index 892f03c4..59a7baf8 100644
+--- a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
++++ b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
+@@ -76,6 +76,8 @@ class AssetsCfg:
+     # convention: metric bbox / object_base_size) and is required with it.
+     object_urdf: str = ""
+     object_scale: tuple[float, float, float] | None = None
++    # OakInk / real-mesh dataset manifest JSON (from prepare_oakink_assets.py).
++    dataset_manifest: str = ""
+     handle_head_types: tuple[str, ...] = (
+         "hammer",
+         "screwdriver",
+@@ -143,6 +145,10 @@ class ObsCfg:
+     )
+ 
+     clamp_abs_observations: float = 10.0
++    # Replace bbox keypoints/object_scales with 128-pt object pointcloud (8 ch/pt: rel_palm+aff+s_ax+goal_disp)
++    use_pointcloud_obs: bool = False
++    # Append 39-dim morphology-invariant grasp ref feature (per-env ref index) before pointcloud
++    use_grasp_ref_feat: bool = False
+ 
+ 
+ # ----------------------------------------------------------------------------
+@@ -349,6 +355,19 @@ class RewardCfg:
+     kuka_actions_penalty_scale: float = 0.03
+     hand_actions_penalty_scale: float = 0.003
+ 
++    # Grasp-quality reward (graspcalculator), paid once when the object is first lifted. Off unless ref is set.
++    grasp_score_rew_scale: float = 0.0
++    grasp_score_ref: str = ""
++    grasp_score_ref_dir: str = ""
++    grasp_score_afford_part: str = "grip"
++    graspcalc_root: str = "/home/szc/work/graspcalculator"
++    grasp_score_obj_pts: int = 1024
++    grasp_score_chunk: int = 16
++    grasp_score_backend: str = "analytic"
++    grasp_score_transformer_ckpt: str = ""
++    grasp_score_interval: int = 0
++    grasp_score_pre_lift_mult: float = 1.0
++
+ 
+ # ----------------------------------------------------------------------------
+ # reset (includes goal sampling — both fire on _reset_idx)
+@@ -411,6 +430,12 @@ class ResetCfg:
+     fixed_trajectory_file: str = ""
+     fixed_trajectory_count: int = 0
+ 
++    # Human-like category-aware functional tool-use goal trajectories
++    human_like_goals: bool = False
++    human_like_goal_horizon: int = 32
++    human_like_yaw_range_deg: float = 30.0
++    human_like_scale_range: tuple[float, float] = (0.85, 1.15)
++
+ 
+ # ----------------------------------------------------------------------------
+ # termination (includes tolerance curriculum — governs success criterion)
+@@ -443,6 +468,13 @@ class TerminationCfg:
+     tolerance_curriculum_interval: int = 3000  # env steps across all agents
+     tolerance_curriculum_success_threshold: float = 3.0
+ 
++    # Grasp-score threshold curriculum: fixes success_tolerance and raises
++    # required live grasp_score_v2 when pos_near (d_max <= tol) holds.
++    use_grasp_score_curriculum: bool = False
++    grasp_score_threshold_start: float = 0.0
++    grasp_score_threshold_step: float = 0.05
++    grasp_score_threshold_max: float = 0.40
++
+ 
+ # ----------------------------------------------------------------------------
+ # domain_randomization
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py b/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py
+index 73a091e4..38cff6b7 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py
+@@ -1,4 +1,4 @@
+-"""Pure-torch goal-pose samplers for SimToolReal."""
++"""Pure-torch goal-pose samplers for SimToolReal (random + human-like tool-use trajectories)."""
+ 
+ from __future__ import annotations
+ 
+@@ -62,4 +62,179 @@ def sample_delta_goal_pose(
+     return new_pos, new_quat
+ 
+ 
+-__all__ = ["sample_absolute_goal_pose", "sample_delta_goal_pose"]
++def _euler_xyz_to_quat_wxyz(
++    roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor
++) -> torch.Tensor:
++    """Convert XYZ intrinsic (roll, pitch, yaw) tensors of shape (...) to wxyz quats (..., 4)."""
++    cr, sr = torch.cos(roll * 0.5), torch.sin(roll * 0.5)
++    cp, sp = torch.cos(pitch * 0.5), torch.sin(pitch * 0.5)
++    cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
++    w = cr * cp * cy + sr * sp * sy
++    x = sr * cp * cy - cr * sp * sy
++    y = cr * sp * cy + sr * cp * sy
++    z = cr * cp * sy - sr * sp * cy
++    return torch.stack([w, x, y, z], dim=-1)
++
++
++def sample_human_like_trajectories(
++    category_ids: torch.Tensor,          # (N,) long
++    categories: list[str],
++    num_steps: int,
++    mins: tuple[float, float, float],
++    maxs: tuple[float, float, float],
++    yaw_range_deg: float = 30.0,
++    scale_range: tuple[float, float] = (0.85, 1.15),
++    device: torch.device | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Generate category-aware human-like functional tool-use trajectories.
++
++    All tools are assumed to be in canonical frame:
++      +X = handle -> working head/tip, +Y = secondary axis, +Z = thinnest axis.
++
++    Step 0 is a lifted functional ready pose; steps 1..K-1 execute realistic
++    cyclic tool motions (hammer swing, screwdriver spin, pen draw, knife slice,
++    pan toss, sprayer/drill aim) with bounded workspace translation, yaw, and
++    amplitude randomization — no arbitrary 3D tumbling.
++
++    Returns:
++        pos:  (N, K, 3) env-local positions clamped inside workspace bounds.
++        quat: (N, K, 4) wxyz unit quaternions.
++    """
++    dev = device or category_ids.device
++    n = category_ids.shape[0]
++    k = num_steps
++
++    # Phase parameter u in [0, 1] across the K steps; step 0 is u=0 (ready pose).
++    u = torch.linspace(0.0, 1.0, k, device=dev, dtype=torch.float32).unsqueeze(0).expand(n, k)
++    cycles = 2.0 * math.pi * u
++
++    # Per-env randomization: workspace anchor, yaw offset, amplitude scale, variant bit
++    anchor = torch.stack(
++        [
++            torch.empty(n, device=dev).uniform_(-0.08, 0.12),
++            torch.empty(n, device=dev).uniform_(-0.04, 0.10),
++            torch.empty(n, device=dev).uniform_(0.66, 0.74),
++        ],
++        dim=-1,
++    )  # (N, 3)
++    yaw_off = torch.empty(n, device=dev).uniform_(-yaw_range_deg, yaw_range_deg) * (
++        math.pi / 180.0
++    )
++    amp = torch.empty(n, device=dev).uniform_(scale_range[0], scale_range[1]).unsqueeze(1)  # (N, 1)
++    variant = torch.rand(n, device=dev) > 0.5  # (N,) bool for dual-mode tools
++
++    # Local trajectory offsets (dx, dy, dz) and Euler angles (roll, pitch, yaw)
++    dx = torch.zeros(n, k, device=dev)
++    dy = torch.zeros(n, k, device=dev)
++    dz = torch.zeros(n, k, device=dev)
++    roll = torch.zeros(n, k, device=dev)
++    pitch = torch.zeros(n, k, device=dev)
++    yaw = torch.zeros(n, k, device=dev)
++
++    # Default functional motion: gentle forward-back aiming sweep (drill, sprayer, flashlight)
++    dx = 0.05 * amp * torch.sin(cycles)
++    dy = 0.04 * amp * torch.sin(2.0 * cycles)
++    dz = 0.02 * amp * torch.cos(cycles)
++    pitch = 0.18 * torch.sin(cycles)
++    yaw = 0.25 * torch.sin(cycles)
++
++    for cid, cat in enumerate(categories):
++        m = category_ids == cid
++        if not m.any():
++            continue
++        c_u = cycles[m]
++        c_amp = amp[m]
++        c_var = variant[m].unsqueeze(1)
++
++        if cat == "hammer":
++            # Variant 0: swing_down (vertical strike arc); Variant 1: swing_side (lateral arc)
++            down_dx = -0.07 * c_amp * torch.sin(c_u)
++            down_dy = 0.02 * c_amp * torch.sin(c_u)
++            down_dz = 0.06 * c_amp * torch.cos(c_u)
++            down_pitch = 0.65 * torch.sin(c_u)
++            down_yaw = torch.zeros_like(c_u)
++
++            side_dx = 0.06 * c_amp * torch.sin(c_u)
++            side_dy = 0.07 * c_amp * torch.cos(c_u)
++            side_dz = 0.02 * c_amp * torch.sin(c_u)
++            side_pitch = torch.zeros_like(c_u)
++            side_yaw = 0.55 * torch.sin(c_u)
++
++            dx[m] = torch.where(c_var, side_dx, down_dx)
++            dy[m] = torch.where(c_var, side_dy, down_dy)
++            dz[m] = torch.where(c_var, side_dz, down_dz)
++            roll[m] = 0.0
++            pitch[m] = torch.where(c_var, side_pitch, down_pitch)
++            yaw[m] = torch.where(c_var, side_yaw, down_yaw)
++
++        elif cat in ("screwdriver", "wrench"):
++            # Spin around tool long axis (+X): vertical (pointed down) or horizontal
++            base_pitch = torch.where(c_var, torch.full_like(c_u, 0.0), torch.full_like(c_u, 1.25))
++            dx[m] = 0.015 * c_amp * torch.sin(c_u)
++            dy[m] = 0.015 * c_amp * torch.cos(c_u)
++            dz[m] = 0.02 * c_amp * torch.sin(0.5 * c_u)
++            roll[m] = 1.45 * torch.sin(2.0 * c_u)
++            pitch[m] = base_pitch
++            yaw[m] = 0.1 * torch.sin(c_u)
++
++        elif cat in ("pen", "marker", "toothbrush"):
++            # Writing / brushing: tilted tip down ~35 deg, smooth arc / figure-8 in XY
++            dx[m] = 0.08 * c_amp * torch.sin(c_u)
++            dy[m] = 0.05 * c_amp * torch.sin(2.0 * c_u)
++            dz[m] = -0.02 + 0.015 * c_amp * torch.cos(2.0 * c_u)
++            roll[m] = 0.15 * torch.sin(c_u)
++            pitch[m] = 0.60 + 0.10 * torch.sin(c_u)
++            yaw[m] = 0.20 * torch.sin(c_u)
++
++        elif cat in ("knife", "scissors", "pincer"):
++            # Slicing / cutting: back-and-forth along tool axis with slight pitch rocking
++            dx[m] = 0.08 * c_amp * torch.sin(2.0 * c_u)
++            dy[m] = 0.025 * c_amp * torch.sin(c_u)
++            dz[m] = -0.02 + 0.025 * c_amp * torch.cos(2.0 * c_u)
++            roll[m] = 0.0
++            pitch[m] = 0.22 * torch.sin(2.0 * c_u)
++            yaw[m] = 0.15 * torch.sin(c_u)
++
++        elif cat == "fryingpan":
++            # Level pan with gentle toss / lift-and-tilt arc
++            dx[m] = 0.06 * c_amp * torch.sin(c_u)
++            dy[m] = 0.04 * c_amp * torch.cos(c_u)
++            dz[m] = 0.04 * c_amp * torch.sin(2.0 * c_u)
++            roll[m] = 0.15 * torch.sin(c_u)
++            pitch[m] = -0.25 * torch.sin(2.0 * c_u)
++            yaw[m] = 0.15 * torch.sin(c_u)
++
++        elif cat in ("power_drill", "trigger_sprayer", "flashlight"):
++            # Aimed steady forward/slightly down with controlled pan & trigger/aim position
++            dx[m] = 0.04 * c_amp * torch.sin(c_u)
++            dy[m] = 0.06 * c_amp * torch.sin(c_u)
++            dz[m] = 0.03 * c_amp * torch.cos(c_u)
++            roll[m] = 0.0
++            pitch[m] = 0.12 + 0.12 * torch.sin(c_u)
++            yaw[m] = 0.30 * torch.sin(c_u)
++
++    # Rotate local XY displacement by per-env yaw_off and add anchor
++    cy = torch.cos(yaw_off).unsqueeze(1)
++    sy = torch.sin(yaw_off).unsqueeze(1)
++    rx = cy * dx - sy * dy
++    ry = sy * dx + cy * dy
++
++    pos = torch.stack(
++        [anchor[:, 0:1] + rx, anchor[:, 1:2] + ry, anchor[:, 2:3] + dz],
++        dim=-1,
++    )
++    mins_t = torch.as_tensor(mins, device=dev, dtype=torch.float32)
++    maxs_t = torch.as_tensor(maxs, device=dev, dtype=torch.float32)
++    pos = torch.clamp(pos, mins_t, maxs_t)
++
++    # Apply global yaw_off around Z
++    quat_local = _euler_xyz_to_quat_wxyz(roll, pitch, yaw + yaw_off.unsqueeze(1))
++    quat_local = torch.nn.functional.normalize(quat_local, dim=-1)
++    return pos, quat_local
++
++
++__all__ = [
++    "sample_absolute_goal_pose",
++    "sample_delta_goal_pose",
++    "sample_human_like_trajectories",
++]
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/grasp_score_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/grasp_score_utils.py
+new file mode 100644
+index 00000000..e3bb67c4
+--- /dev/null
++++ b/isaacsimenvs/tasks/simtoolreal/utils/grasp_score_utils.py
+@@ -0,0 +1,289 @@
++"""Grasp-quality reward from graspcalculator (https://github.com/shez12/GraspCalculator).
++
++Supports two backends:
++- "analytic": exact F1 * gate(F4p) * F4d scorer.
++- "transformer": distilled reference-conditioned Point Transformer scorer (fp16 GPU).
++
++Scoring trigger (controlled by cfg.reward.grasp_score_interval):
++- interval > 0: every `interval` simulation steps after reset (episode_length_buf % interval == 0).
++- interval <= 0: once when the object is first lifted.
++"""
++
++from __future__ import annotations
++
++import sys
++import xml.etree.ElementTree as ET
++from pathlib import Path
++
++import numpy as np
++import torch
++
++GRASP_TERMS = ("grasp_score", "grasp_f1", "grasp_f4p", "grasp_f4d", "grasp_scored")
++
++
++def _origin(el):
++    from scipy.spatial.transform import Rotation
++
++    T = np.eye(4)
++    o = el.find("origin")
++    if o is not None:
++        T[:3, :3] = Rotation.from_euler("xyz", [float(v) for v in o.get("rpy", "0 0 0").split()]).as_matrix()
++        T[:3, 3] = [float(v) for v in o.get("xyz", "0 0 0").split()]
++    return T
++
++
++def _object_points(urdf_path: str, n_pts: int, afford: int, other: int, seed: int = 0):
++    """Surface points / normals / part labels of an object URDF in its root-link frame."""
++    import trimesh
++    from graspcalc.objects import axis_part_labels
++
++    root = ET.parse(urdf_path).getroot()
++    meshes, primitive = [], True
++    for c in root.iter("collision"):
++        g = c.find("geometry")
++        if g.find("box") is not None:
++            m = trimesh.creation.box(extents=[float(v) for v in g.find("box").get("size").split()])
++        elif g.find("cylinder") is not None:
++            cy = g.find("cylinder")
++            m = trimesh.creation.cylinder(radius=float(cy.get("radius")), height=float(cy.get("length")))
++        elif g.find("sphere") is not None:
++            m = trimesh.creation.icosphere(radius=float(g.find("sphere").get("radius")))
++        elif g.find("mesh") is not None:
++            me = g.find("mesh")
++            m = trimesh.load(str(Path(urdf_path).parent / me.get("filename")), force="mesh")
++            if me.get("scale"):
++                m.apply_scale([float(v) for v in me.get("scale").split()])
++            primitive = False
++        else:
++            continue
++        m.apply_transform(_origin(c))
++        meshes.append(m)
++    merged = trimesh.util.concatenate(meshes)
++    face_part = np.concatenate([np.full(len(m.faces), i) for i, m in enumerate(meshes)])
++    pts, fi = trimesh.sample.sample_surface(merged, n_pts, seed=seed)
++    nrm = merged.face_normals[fi]
++    if primitive and len(meshes) == 2:
++        lab = np.where(face_part[fi] == 0, afford, other)
++    elif primitive:
++        lab = np.full(n_pts, afford)
++    else:
++        lab = np.where(axis_part_labels(pts) == 1, other, afford)
++    return pts, nrm, lab
++
++
++def _quat_to_mat(q):  # (..., 4) wxyz -> (..., 3, 3)
++    w, x, y, z = q.unbind(-1)
++    return torch.stack(
++        [
++            1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
++            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
++            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
++        ],
++        -1,
++    ).view(*q.shape[:-1], 3, 3)
++
++
++def init_grasp_scorer(env) -> None:
++    """Called once after allocate_state_buffers. No-op unless ref or ref_dir is set."""
++    rew = env.cfg.reward
++    env._grasp_scorer = None
++    env._grasp_scorers_by_cat = None
++    env._grasp_asset_cat_ids = None
++    env._grasp_backend = "analytic"
++    env._grasp_terms = {k: torch.zeros(env.num_envs, device=env.device) for k in GRASP_TERMS}
++    ref_dir = getattr(rew, "grasp_score_ref_dir", "")
++    if not rew.grasp_score_ref and not ref_dir:
++        return
++    if rew.graspcalc_root not in sys.path:
++        sys.path.insert(0, rew.graspcalc_root)
++    from graspcalc.hands import URDFHand
++    from graspcalc.robots import sharpa_ha4
++
++    repo_root = Path(__file__).resolve().parents[4]
++    robot_urdf = Path(env.cfg.assets.robot_urdf)
++    robot_urdf = robot_urdf if robot_urdf.is_absolute() else repo_root / robot_urdf
++    env._grasp_hand = URDFHand(sharpa_ha4("left", urdf_path=str(robot_urdf)), device=env.device)
++
++    backend = getattr(rew, "grasp_score_backend", "analytic")
++    env._grasp_backend = backend
++    if backend == "transformer":
++        from graspcalc.transformer_scorer import TransformerGraspScorer
++
++        ckpt = getattr(rew, "grasp_score_transformer_ckpt", "")
++        if not ckpt:
++            raise ValueError("grasp_score_backend='transformer' requires grasp_score_transformer_ckpt")
++        env._grasp_scorer = TransformerGraspScorer.from_checkpoint(
++            ckpt_path=ckpt,
++            ref_path=rew.grasp_score_ref,
++            afford_parts=(rew.grasp_score_afford_part,),
++            device=env.device,
++            use_fp16=True,
++        )
++        vocab = [rew.grasp_score_afford_part, "other"]
++        afford, other = 0, 1
++    elif ref_dir:
++        if backend == "invariant_v2":
++            from graspcalc.invariant_scorer import InvariantGraspScorer as _ScorerCls
++        else:
++            from graspcalc.scorer import GraspScorer as _ScorerCls
++
++        asset_clouds = getattr(env, "_asset_clouds", None)
++        if asset_clouds is None or "categories" not in asset_clouds:
++            raise ValueError("grasp_score_ref_dir requires dataset_manifest with per-asset categories")
++        ref_dir_p = Path(ref_dir)
++        scorers_by_cat = {}
++        for cid, cname in enumerate(asset_clouds["categories"]):
++            cand = ref_dir_p / f"{cname}.pt"
++            if not cand.exists():
++                if rew.grasp_score_ref:
++                    cand = Path(rew.grasp_score_ref)
++                else:
++                    raise FileNotFoundError(f"Missing per-category ref for '{cname}': {cand}")
++            scorers_by_cat[cid] = _ScorerCls.from_file(
++                str(cand),
++                [rew.grasp_score_afford_part],
++                device=env.device,
++                chunk=rew.grasp_score_chunk,
++            )
++        env._grasp_scorers_by_cat = scorers_by_cat
++        env._grasp_asset_cat_ids = asset_clouds["category_id"].to(env.device, dtype=torch.long)
++        env._grasp_scorer = scorers_by_cat[0]
++        vocab = env._grasp_scorer.vocab
++        afford = vocab.index(rew.grasp_score_afford_part)
++        other = next(i for i in range(len(vocab)) if i != afford)
++    else:
++        if backend == "invariant_v2":
++            from graspcalc.invariant_scorer import InvariantGraspScorer as _ScorerCls
++        else:
++            from graspcalc.scorer import GraspScorer as _ScorerCls
++
++        env._grasp_scorer = _ScorerCls.from_file(
++            rew.grasp_score_ref,
++            [rew.grasp_score_afford_part],
++            device=env.device,
++            chunk=rew.grasp_score_chunk,
++        )
++        vocab = env._grasp_scorer.vocab
++        afford = vocab.index(rew.grasp_score_afford_part)
++        other = next(i for i in range(len(vocab)) if i != afford)
++
++    # Prefer pre-cached OakInk asset clouds when dataset_manifest was used
++    asset_clouds = getattr(env, "_asset_clouds", None)
++    if asset_clouds is not None:
++        pts = asset_clouds["points"].to(env.device, dtype=torch.float32)
++        nrm = asset_clouds["normals"].to(env.device, dtype=torch.float32)
++        aff = asset_clouds["afford_mask"].to(env.device, dtype=torch.float32)
++        env._grasp_obj_pts = pts
++        env._grasp_obj_nrm = nrm
++        env._grasp_obj_aff = aff
++        env._grasp_obj_lab = torch.where(aff > 0.5, torch.full_like(aff, afford, dtype=torch.long), torch.full_like(aff, other, dtype=torch.long))
++        n_assets = pts.shape[0]
++    else:
++        P, N, L = [], [], []
++        for path in env._object_urdf_paths:
++            p, n, l = _object_points(path, rew.grasp_score_obj_pts, afford, other)
++            P.append(p), N.append(n), L.append(l)
++        env._grasp_obj_pts = torch.tensor(np.stack(P), dtype=torch.float32, device=env.device)
++        env._grasp_obj_nrm = torch.tensor(np.stack(N), dtype=torch.float32, device=env.device)
++        env._grasp_obj_lab = torch.tensor(np.stack(L), dtype=torch.long, device=env.device)
++        env._grasp_obj_aff = (env._grasp_obj_lab == afford).float()
++        n_assets = len(P)
++
++    env._grasp_body_names = list(env.robot.body_names)
++
++    # Pre-cache 39-dim morphology-invariant ref feature table (R, 39) & per-env ref index (N,)
++    # for goal-conditioned policy/critic observations (supports future multi-ref sampling per object).
++    if env._grasp_scorers_by_cat:
++        num_refs = len(env._grasp_scorers_by_cat)
++        feats = []
++        for cid in range(num_refs):
++            sc = env._grasp_scorers_by_cat[cid]
++            if hasattr(sc, "ref_feature_vector"):
++                feats.append(sc.ref_feature_vector().to(device=env.device, dtype=torch.float32))
++            else:
++                feats.append(torch.zeros(39, device=env.device, dtype=torch.float32))
++        env._grasp_ref_feats = torch.stack(feats, dim=0)  # (R, 39)
++        env._grasp_env_ref_ids = env._grasp_asset_cat_ids[env._object_asset_index_per_env].clone()
++    elif env._grasp_scorer is not None and hasattr(env._grasp_scorer, "ref_feature_vector"):
++        env._grasp_ref_feats = env._grasp_scorer.ref_feature_vector().to(device=env.device, dtype=torch.float32).unsqueeze(0)
++        env._grasp_env_ref_ids = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
++    else:
++        env._grasp_ref_feats = torch.zeros((1, 39), device=env.device, dtype=torch.float32)
++        env._grasp_env_ref_ids = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
++
++    interval = getattr(rew, "grasp_score_interval", 0)
++    trig = f"every {interval} steps" if interval > 0 else "at first lift"
++    ref_desc = f"dir:{ref_dir} ({len(env._grasp_scorers_by_cat)} cats)" if env._grasp_scorers_by_cat else rew.grasp_score_ref
++    print(
++        f"[grasp_score] backend={backend} ref={ref_desc} "
++        f"afford='{rew.grasp_score_afford_part}' trigger=({trig}) "
++        f"assets={n_assets} scale={rew.grasp_score_rew_scale} pre_lift_mult={getattr(rew, 'grasp_score_pre_lift_mult', 1.0)}"
++    )
++
++
++def _score_single_group(env, scorer, sub_ids: torch.Tensor) -> dict[str, torch.Tensor]:
++    B = len(sub_ids)
++    pos = env.robot.data.body_link_pos_w[sub_ids]
++    rot = _quat_to_mat(env.robot.data.body_link_quat_w[sub_ids])
++    link_T = {}
++    for i, name in enumerate(env._grasp_body_names):
++        T = torch.eye(4, device=env.device).repeat(B, 1, 1)
++        T[:, :3, :3], T[:, :3, 3] = rot[:, i], pos[:, i]
++        link_T[name] = T
++    hand = env._grasp_hand.from_link_poses(link_T)
++    asset = env._object_asset_index_per_env[sub_ids]
++    Ro = _quat_to_mat(env.object.data.root_quat_w[sub_ids])
++    po = env.object.data.root_pos_w[sub_ids]
++    obj = torch.einsum("bij,bmj->bmi", Ro, env._grasp_obj_pts[asset]) + po[:, None]
++    with torch.no_grad():
++        if env._grasp_backend == "transformer":
++            return scorer.score(hand, env._grasp_hand.palm_normal_sign, obj, env._grasp_obj_aff[asset])
++        obj_n = torch.einsum("bij,bmj->bmi", Ro, env._grasp_obj_nrm[asset])
++        return scorer.score(hand, env._grasp_hand.palm_normal_sign, obj, obj_n, env._grasp_obj_lab[asset])
++
++
++def score_grasps(env, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
++    """Scores the current hand pose of env_ids against the reference (per-category if ref_dir is set)."""
++    B_all = len(env_ids)
++    if getattr(env, "_grasp_scorers_by_cat", None):
++        out = {k: torch.zeros(B_all, device=env.device, dtype=torch.float32) for k in ("total", "f1", "f4p", "f4d")}
++        cat_ids = env._grasp_env_ref_ids[env_ids]
++        for cid in torch.unique(cat_ids).tolist():
++            mask = cat_ids == cid
++            r = _score_single_group(env, env._grasp_scorers_by_cat[int(cid)], env_ids[mask])
++            for k in out:
++                out[k][mask] = r[k].float()
++        return out
++
++    chunk_sz = 512 if env._grasp_backend == "transformer" else B_all
++    outs: dict[str, list[torch.Tensor]] = {"total": [], "f1": [], "f4p": [], "f4d": []}
++    for start in range(0, B_all, chunk_sz):
++        r = _score_single_group(env, env._grasp_scorer, env_ids[start : start + chunk_sz])
++        for k in outs:
++            outs[k].append(r[k])
++    return {k: torch.cat(v, dim=0) for k, v in outs.items()}
++
++
++def grasp_score_reward(env, score_mask: torch.Tensor) -> torch.Tensor:
++    """(N,) reward; also fills env._grasp_terms (raw score terms, non-zero only on scored steps)."""
++    for v in env._grasp_terms.values():
++        v.zero_()
++    rew = torch.zeros(env.num_envs, device=env.device)
++    if env._grasp_scorer is None:
++        return rew
++    ids = score_mask.nonzero(as_tuple=False).squeeze(-1)
++    if len(ids) == 0:
++        return rew
++    r = score_grasps(env, ids)
++    for key, src in (("grasp_score", "total"), ("grasp_f1", "f1"), ("grasp_f4p", "f4p"), ("grasp_f4d", "f4d")):
++        env._grasp_terms[key][ids] = r[src]
++    env._grasp_terms["grasp_scored"][ids] = 1.0
++    env.extras["grasp_score_at_lift"] = float(r["total"].mean())
++    pre_mult = float(getattr(env.cfg.reward, "grasp_score_pre_lift_mult", 1.0))
++    if pre_mult != 1.0 and hasattr(env, "_lifted_object"):
++        lifted = env._lifted_object[ids]
++        mult = torch.where(lifted, torch.ones_like(r["total"]), torch.full_like(r["total"], pre_mult))
++        rew[ids] = env.cfg.reward.grasp_score_rew_scale * mult * r["total"]
++    else:
++        rew[ids] = env.cfg.reward.grasp_score_rew_scale * r["total"]
++    return rew
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py
+index 823b1091..8853256f 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py
+@@ -29,5 +29,30 @@ def log_step_metrics(env) -> None:
+     env.extras["successes"] = env._prev_episode_successes.float()
+     env.extras["current_success_tolerance"] = float(env._current_success_tolerance)
+ 
++    if getattr(term_cfg, "use_grasp_score_curriculum", False):
++        pos_near_f = env._pos_near_goal.float()
++        gated_near_f = env._near_goal.float()
++        prev_succ_f = env._prev_episode_successes.float()
++        env.extras["current_grasp_score_threshold"] = float(
++            getattr(env, "_current_grasp_score_threshold", 0.0)
++        )
++        env.extras["pos_near_rate"] = float(pos_near_f.mean().item())
++        env.extras["gated_near_rate"] = float(gated_near_f.mean().item())
++        env.extras["gated_success_rate"] = float(env._is_success.float().mean().item())
++
++        asset_clouds = getattr(env, "_asset_clouds", None)
++        cat_ids_per_asset = getattr(env, "_grasp_asset_cat_ids", None)
++        thr_per_cat = getattr(env, "_current_grasp_score_threshold_per_cat", None)
++        if asset_clouds is not None and "categories" in asset_clouds and cat_ids_per_asset is not None:
++            env_cat_ids = cat_ids_per_asset[env._object_asset_index_per_env]
++            for cid, cname in enumerate(asset_clouds["categories"]):
++                m = env_cat_ids == cid
++                if m.any():
++                    env.extras[f"pos_near_rate_cat/{cname}"] = float(pos_near_f[m].mean().item())
++                    env.extras[f"gated_near_rate_cat/{cname}"] = float(gated_near_f[m].mean().item())
++                    env.extras[f"successes_cat/{cname}"] = float(prev_succ_f[m].mean().item())
++                    if thr_per_cat is not None and cid < int(thr_per_cat.numel()):
++                        env.extras[f"score_threshold_cat/{cname}"] = float(thr_per_cat[cid].item())
++
+ 
+ __all__ = ["log_step_metrics"]
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
+index ffd8ff96..a4392362 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
+@@ -51,9 +51,120 @@ OBS_FIELD_SIZES: dict[str, int] = {
+     "progress": 1,
+     "successes": 1,
+     "reward": 1,
++    "grasp_ref_feat": 39,  # 24 pose + 12 contact_mat + 3 loc (s_ax, ori_hand, ori_palm)
++    "object_pointcloud": 128 * 8,  # 1024 (xyz_rel_palm + afford_mask + s_ax + goal_disp)
+ }
+ 
+ 
++def _compute_asset_s_ax(pts: torch.Tensor, aff: torch.Tensor) -> torch.Tensor:
++    """Compute per-point normalized 1D functional-axis coordinate s_ax in (A, M, 1).
++    Matches invariant_scorer.py: axis = normalize(mean_other - mean_afford), normalized
++    by the 5%-95% affordance span (defaults to 0.5 when no axis is defined).
++    """
++    aff_bool = aff.squeeze(-1) > 0.5  # (A, M)
++    oth_bool = ~aff_bool
++    aff_cnt = aff_bool.sum(dim=-1)
++    oth_cnt = oth_bool.sum(dim=-1)
++    has_axis = (aff_cnt > 4) & (oth_cnt > 4)
++
++    aff_f = aff_bool.float().unsqueeze(-1)
++    oth_f = oth_bool.float().unsqueeze(-1)
++    aff_mean = (pts * aff_f).sum(dim=1) / aff_cnt.clamp(min=1).float().unsqueeze(-1)
++    oth_mean = (pts * oth_f).sum(dim=1) / oth_cnt.clamp(min=1).float().unsqueeze(-1)
++    axis_v = oth_mean - aff_mean
++    axis_norm = torch.norm(axis_v, dim=-1)
++    has_axis = has_axis & (axis_norm > 1e-3)
++    a_hat = axis_v / axis_norm.clamp(min=1e-6).unsqueeze(-1)  # (A, 3)
++
++    proj = (pts * a_hat.unsqueeze(1)).sum(dim=-1)  # (A, M)
++    big = 1e6
++    proj_min = proj.masked_fill(~aff_bool, big).min(dim=-1).values
++    proj_max = proj.masked_fill(~aff_bool, -big).max(dim=-1).values
++    raw_span = (proj_max - proj_min).clamp(min=0.02)
++    p_lo = proj_min + 0.05 * raw_span
++    p_hi = proj_max - 0.05 * raw_span
++    span = (p_hi - p_lo).clamp(min=0.02)
++    s_ax = ((proj - p_lo.unsqueeze(-1)) / span.unsqueeze(-1)).clamp(-1.0, 2.0)
++    s_ax = torch.where(has_axis.unsqueeze(-1), s_ax, torch.full_like(s_ax, 0.5))
++    return s_ax.unsqueeze(-1).contiguous()
++
++
++def _ensure_obs_pointcloud_buffers(env) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Lazily prepare (A, 128, 3) local points, (A, 128, 1) affordance masks, and (A, 128, 1) s_ax on GPU."""
++    pts = getattr(env, "_obs_asset_pts", None)
++    aff = getattr(env, "_obs_asset_afford", None)
++    sax = getattr(env, "_obs_asset_s_ax", None)
++    if pts is not None and aff is not None and sax is not None:
++        return pts, aff, sax
++    n_pts = 128
++    clouds = getattr(env, "_asset_clouds", None)
++    if clouds is not None:
++        raw_pts = clouds["points"]       # (A, M, 3)
++        raw_aff = clouds["afford_mask"]  # (A, M)
++        m = raw_pts.shape[1]
++        idx = torch.linspace(0, m - 1, n_pts).long()
++        pts = raw_pts[:, idx].to(device=env.device, dtype=torch.float32).contiguous()
++        aff = raw_aff[:, idx].unsqueeze(-1).to(device=env.device, dtype=torch.float32).contiguous()
++    else:
++        # Fallback for procedural / single-URDF eval: sample 128 pts from each URDF
++        import trimesh, numpy as np, xml.etree.ElementTree as ET
++        from pathlib import Path
++        all_p, all_a = [], []
++        for upath in env._object_urdf_paths:
++            u = Path(upath)
++            tree = ET.parse(u)
++            meshes = []
++            for m_el in tree.findall(".//visual/geometry/mesh") or tree.findall(".//collision/geometry/mesh"):
++                fn = m_el.get("filename")
++                if fn:
++                    mp = u.parent / fn
++                    if mp.exists():
++                        meshes.append(trimesh.load(mp, force="mesh", process=False))
++            if meshes:
++                comb = trimesh.util.concatenate(meshes)
++                sp, _ = trimesh.sample.sample_surface(comb, n_pts)
++                sp = np.asarray(sp, dtype=np.float32)
++            else:
++                sp = np.zeros((n_pts, 3), dtype=np.float32)
++            all_p.append(sp)
++            # Heuristic affordance: x <= 0 is handle in canonical/DexToolBench frame
++            all_a.append((sp[:, 0] <= 0.0).astype(np.float32)[:, None])
++        pts = torch.from_numpy(np.stack(all_p)).to(device=env.device, dtype=torch.float32).contiguous()
++        aff = torch.from_numpy(np.stack(all_a)).to(device=env.device, dtype=torch.float32).contiguous()
++    sax = _compute_asset_s_ax(pts, aff)
++    env._obs_asset_pts = pts
++    env._obs_asset_afford = aff
++    env._obs_asset_s_ax = sax
++    return pts, aff, sax
++
++
++def _compute_pointcloud_obs(
++    env,
++    obj_pos: torch.Tensor,
++    obj_rot: torch.Tensor,
++    goal_pos: torch.Tensor,
++    goal_rot: torch.Tensor,
++    palm_pos: torch.Tensor,
++) -> torch.Tensor:
++    """Return (N, 128, 8) tensor: [curr_pts - palm_pos, afford_mask, s_ax, goal_pts - curr_pts]."""
++    asset_pts, asset_aff, asset_sax = _ensure_obs_pointcloud_buffers(env)
++    aidx = env._object_asset_index_per_env
++    local_pts = asset_pts[aidx]      # (N, 128, 3)
++    aff_mask = asset_aff[aidx]       # (N, 128, 1)
++    s_ax = asset_sax[aidx]           # (N, 128, 1)
++    n, m, _ = local_pts.shape
++
++    q_obj = obj_rot.unsqueeze(1).expand(n, m, 4).reshape(-1, 4)
++    q_goal = goal_rot.unsqueeze(1).expand(n, m, 4).reshape(-1, 4)
++    flat_pts = local_pts.reshape(-1, 3)
++
++    curr_pts = quat_apply(q_obj, flat_pts).reshape(n, m, 3) + obj_pos.unsqueeze(1)
++    goal_pts = quat_apply(q_goal, flat_pts).reshape(n, m, 3) + goal_pos.unsqueeze(1)
++    rel_palm = curr_pts - palm_pos.unsqueeze(1)
++    to_goal = goal_pts - curr_pts
++    return torch.cat([rel_palm, aff_mask, s_ax, to_goal], dim=-1)
++
++
+ def compute_obs_dim(field_list) -> int:
+     """Return total tensor dim for an ordered list of obs field names."""
+     return sum(OBS_FIELD_SIZES[f] for f in field_list)
+@@ -193,7 +304,43 @@ def compute_intermediate_values(env) -> None:
+         tol = env._keypoint_success_tolerance_m()
+     else:
+         tol = env._current_success_tolerance * rew_cfg.keypoint_scale
+-    env._near_goal = env._keypoints_max_dist <= tol
++    pos_near = env._keypoints_max_dist <= tol
++    env._pos_near_goal = pos_near
++
++    if getattr(term_cfg, "use_grasp_score_curriculum", False):
++        thr_per_cat = getattr(env, "_current_grasp_score_threshold_per_cat", None)
++        cat_ids_per_asset = getattr(
++            env, "_grasp_asset_cat_ids", getattr(env, "_asset_category_ids", None)
++        )
++        if (
++            thr_per_cat is not None
++            and cat_ids_per_asset is not None
++            and getattr(env, "_object_asset_index_per_env", None) is not None
++        ):
++            env_thr = thr_per_cat[cat_ids_per_asset[env._object_asset_index_per_env]]
++        else:
++            env_thr = torch.full_like(
++                env._keypoints_max_dist,
++                float(getattr(env, "_current_grasp_score_threshold", 0.0)),
++            )
++        need_gate = pos_near & (env_thr > 0.0)
++        has_scorer = (
++            getattr(env, "_grasp_scorer", None) is not None
++            or getattr(env, "_grasp_scorers_by_cat", None) is not None
++        )
++        if has_scorer and need_gate.any():
++            from .grasp_score_utils import score_grasps
++
++            gate_ids = need_gate.nonzero(as_tuple=False).squeeze(-1)
++            live_scores = score_grasps(env, gate_ids)["total"]
++            gated = pos_near & (env_thr <= 0.0)
++            gated[gate_ids] = live_scores >= env_thr[gate_ids]
++            env._near_goal = gated
++        else:
++            env._near_goal = pos_near
++    else:
++        env._near_goal = pos_near
++
+     env._near_goal_steps = update_near_goal_steps(
+         near_goal=env._near_goal,
+         near_goal_steps=env._near_goal_steps,
+@@ -336,6 +483,23 @@ def build_observations(env) -> dict[str, torch.Tensor]:
+             joint_vel + torch.randn_like(joint_vel) * dr.joint_velocity_obs_noise_std
+         )
+ 
++    if "grasp_ref_feat" in env.cfg.obs.obs_list or "grasp_ref_feat" in env.cfg.obs.state_list:
++        ref_feats = getattr(env, "_grasp_ref_feats", None)
++        ref_ids = getattr(env, "_grasp_env_ref_ids", None)
++        if ref_feats is not None and ref_ids is not None:
++            rf = ref_feats[ref_ids]
++        else:
++            rf = torch.zeros((env.num_envs, 39), device=env.device, dtype=torch.float32)
++        obs_clean["grasp_ref_feat"] = rf
++        obs_noisy["grasp_ref_feat"] = rf
++
++    if "object_pointcloud" in env.cfg.obs.obs_list or "object_pointcloud" in env.cfg.obs.state_list:
++        pc_clean = _compute_pointcloud_obs(env, obj_pos, obj_rot, goal_pos, goal_rot, palm_pos)
++        noisy_g_rot = noisy_goal_rot if (goal_yaw_obs_noise is not None and torch.any(goal_yaw_obs_noise != 0)) else goal_rot
++        pc_noisy = _compute_pointcloud_obs(env, noisy_obj_pos, noisy_obj_rot, goal_pos, noisy_g_rot, palm_pos)
++        obs_clean["object_pointcloud"] = pc_clean
++        obs_noisy["object_pointcloud"] = pc_noisy
++
+     state_tensor = _stack_obs_dict(obs_clean, env.cfg.obs.state_list)
+     policy_tensor = _stack_obs_dict(obs_noisy, env.cfg.obs.obs_list)
+ 
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py b/isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py
+new file mode 100644
+index 00000000..60b3067e
+--- /dev/null
++++ b/isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py
+@@ -0,0 +1,461 @@
++"""Offline preprocessing of OakInk-Shape + OakBase tool assets for SimToolReal.
++
++For each selected OakInk tool object:
++  1. Loads the OakInk mesh and strips any support plate via OakBase part clouds.
++  2. Canonicalizes its frame (X = long axis handle->head, Y = second axis,
++     Z = thinnest axis so it lies flat on the table) and records T_canon (4x4)
++     so OakInk grasps can be mapped directly into the canonical frame.
++  3. Runs CoACD convex decomposition to build an Isaac-Sim-ready URDF with
++     explicit <mass> and <inertia>.
++  4. Samples N surface points with normals, OakBase part IDs, and binary
++     affordance mask (held_by_hand / trigger) for PointNet and grasp scoring.
++  5. Writes manifest.json and a consolidated asset_clouds.pt for fast GPU load.
++
++Usage:
++    PYTHONPATH=/home/szc/work/newsimtoolreal/simtoolreal:/home/szc/work/graspcalculator \
++    /home/szc/.conda/envs/simtoolreal_isaacsim/bin/python \
++        isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py \
++        --out_dir /home/szc/data/simtoolreal_oakink_assets \
++        --max_per_cat 16 --workers 8
++"""
++
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++import os
++import sys
++import xml.etree.ElementTree as ET
++import multiprocessing as mp
++from concurrent.futures import ProcessPoolExecutor, as_completed
++from pathlib import Path
++
++import numpy as np
++import torch
++import trimesh
++from scipy.spatial import cKDTree
++
++REPO_ROOT = Path(__file__).resolve().parents[4]
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++GRASPCALC_ROOT = Path("/home/szc/work/graspcalculator")
++if str(GRASPCALC_ROOT) not in sys.path:
++    sys.path.insert(0, str(GRASPCALC_ROOT))
++
++from dextoolbench.run_coacd import run_coacd
++from graspcalc.oakink import load_mesh
++from graspcalc.paths import OAKBASE_DIR, SHAPE_DIR
++
++DEFAULT_TOOL_CATEGORIES = (
++    "hammer",
++    "screwdriver",
++    "pen",
++    "knife",
++    "scissors",
++    "toothbrush",
++    "flashlight",
++    "fryingpan",
++    "power_drill",
++    "trigger_sprayer",
++    "wrench",
++    "pincer",
++)
++
++OAKBASE_CAT_MAP = {
++    "pen": "marker",
++    "scissors": "scissor",
++    "fryingpan": "frying_pan",
++    "cameras": "camera",
++    "gamecontroller": "game_controller",
++    "lotion_pump": "lotion_bottle",
++    "squeezable": "squeeze_tube",
++}
++
++
++def resolve_oakbase_cat(cat: str) -> str:
++    if os.path.isdir(os.path.join(OAKBASE_DIR, cat)):
++        return cat
++    return OAKBASE_CAT_MAP.get(cat, cat)
++
++
++def load_oakbase_parts(ob_cat: str, obj_name: str):
++    """Return list of (short_name, attrs_list, points_np) for an OakBase object."""
++    part_dir = os.path.join(OAKBASE_DIR, ob_cat, obj_name)
++    files = sorted(glob.glob(os.path.join(part_dir, "part_*.json")))
++    if not files:
++        return []
++    parts = []
++    for jf in files:
++        meta = json.load(open(jf))
++        raw_name = meta.get("name", "")
++        short = raw_name[len(ob_cat) + 1 :] if raw_name.startswith(ob_cat + "_") else raw_name
++        attrs = meta.get("attr", [])
++        if isinstance(attrs, str):
++            attrs = [attrs]
++        ply = jf[:-5] + ".ply"
++        pts = np.asarray(trimesh.load(ply, process=False).vertices, dtype=np.float64)
++        parts.append((short, attrs, pts))
++    return parts
++
++
++def is_affordance_part(cat: str, short_name: str, attrs: list[str]) -> bool:
++    """Identify the functional grasp part for a tool category."""
++    if cat == "trigger_sprayer":
++        return short_name in ("trigger", "closure") or "trigger" in short_name
++    if "held_by_hand" in attrs:
++        if short_name in ("body", "bottle_body", "mug_body", "teapot_body", "pan_body"):
++            return False
++        return True
++    return any(k in short_name for k in ("grip", "handle", "pen_body"))
++
++
++def canonicalize_transform(
++    pts: np.ndarray,
++    afford_mask: np.ndarray,
++) -> np.ndarray:
++    """Build right-handed 4x4 T_canon mapping original OakInk frame -> canonical frame.
++
++    Canonical convention (matching DexToolBench):
++      - Origin at bounding-box midpoint in canonical frame
++      - +X = longest principal axis, oriented handle (-X) -> working end (+X)
++      - +Y = second principal axis
++      - +Z = thinnest principal axis (tool rests flat on table)
++    """
++    center = pts.mean(axis=0)
++    centered = pts - center
++    cov = np.cov(centered.T)
++    eigvals, eigvecs = np.linalg.eigh(cov)
++    order = np.argsort(eigvals)[::-1]
++    R = eigvecs[:, order].T  # rows are new axes in original frame
++
++    if afford_mask.any() and (~afford_mask).any():
++        aff_x = (centered[afford_mask] @ R[0]).mean()
++        wrk_x = (centered[~afford_mask] @ R[0]).mean()
++        if wrk_x < aff_x:
++            R[0] = -R[0]
++
++    if np.linalg.det(R) < 0:
++        R[2] = -R[2]
++
++    rot_pts = pts @ R.T
++    bbox_mid = 0.5 * (rot_pts.min(axis=0) + rot_pts.max(axis=0))
++    t = -bbox_mid
++
++    T = np.eye(4, dtype=np.float64)
++    T[:3, :3] = R
++    T[:3, 3] = t
++    return T
++
++
++def build_urdf(
++    urdf_path: Path,
++    obj_name: str,
++    visual_rel: str,
++    collision_rels: list[str],
++    parts: list[trimesh.Trimesh],
++    density: float = 400.0,
++    min_mass: float = 0.05,
++    max_mass: float = 0.35,
++) -> float:
++    """Write an Isaac-Sim-ready URDF with explicit <mass> and <inertia>."""
++    combined = trimesh.util.concatenate(parts)
++    combined.density = density
++    raw_mass = float(combined.mass)
++    if not np.isfinite(raw_mass) or raw_mass <= 1e-6:
++        raw_mass = 0.12
++    mass = float(np.clip(raw_mass, min_mass, max_mass))
++    scale_inertia = mass / max(raw_mass, 1e-6)
++    com = combined.center_mass
++    if not np.all(np.isfinite(com)):
++        com = np.zeros(3)
++    it = combined.moment_inertia * scale_inertia
++    if not np.all(np.isfinite(it)):
++        it = np.eye(3) * (mass * 0.002)
++    for i in range(3):
++        it[i, i] = max(float(it[i, i]), 1e-5)
++
++    robot = ET.Element("robot", name=obj_name)
++    link = ET.SubElement(robot, "link", name="object")
++
++    inertial = ET.SubElement(link, "inertial")
++    ET.SubElement(inertial, "origin", xyz=f"{com[0]:.6g} {com[1]:.6g} {com[2]:.6g}", rpy="0 0 0")
++    ET.SubElement(inertial, "mass", value=f"{mass:.6g}")
++    ET.SubElement(
++        inertial,
++        "inertia",
++        ixx=f"{it[0, 0]:.6g}",
++        ixy=f"{it[0, 1]:.6g}",
++        ixz=f"{it[0, 2]:.6g}",
++        iyy=f"{it[1, 1]:.6g}",
++        iyz=f"{it[1, 2]:.6g}",
++        izz=f"{it[2, 2]:.6g}",
++    )
++
++    vis = ET.SubElement(link, "visual")
++    ET.SubElement(vis, "origin", xyz="0 0 0", rpy="0 0 0")
++    vgeom = ET.SubElement(vis, "geometry")
++    ET.SubElement(vgeom, "mesh", filename=visual_rel, scale="1 1 1")
++
++    for crel in collision_rels:
++        col = ET.SubElement(link, "collision")
++        ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
++        cgeom = ET.SubElement(col, "geometry")
++        ET.SubElement(cgeom, "mesh", filename=crel, scale="1 1 1")
++
++    ET.indent(robot, space="  ")
++    ET.ElementTree(robot).write(urdf_path, encoding="utf-8", xml_declaration=True)
++    return mass
++
++
++def process_one_object(task: tuple) -> dict | None:
++    cat, ob_cat, oid, name, out_root, n_pts, max_hull, threshold = task
++    obj_out = Path(out_root) / cat / oid
++    urdf_path = obj_out / f"{oid}.urdf"
++    cloud_path = obj_out / "cloud.npz"
++    meta_path = obj_out / "meta.json"
++
++    if urdf_path.exists() and cloud_path.exists() and meta_path.exists():
++        return json.load(open(meta_path))
++
++    try:
++        mesh, _ = load_mesh(SHAPE_DIR, oid)
++    except Exception as e:
++        return {"_error": f"{cat}/{oid}: load_mesh failed: {e}"}
++
++    parts_info = load_oakbase_parts(ob_cat, name)
++    if not parts_info:
++        return {"_error": f"{cat}/{oid}: no OakBase parts"}
++
++    part_names = [p[0] for p in parts_info]
++    part_attrs = [p[1] for p in parts_info]
++    part_clouds = [p[2] for p in parts_info]
++    all_part_pts = np.concatenate(part_clouds, axis=0)
++    all_part_ids = np.concatenate(
++        [np.full(len(c), i, dtype=np.int64) for i, c in enumerate(part_clouds)]
++    )
++
++    tree = cKDTree(all_part_pts)
++    face_dists, _ = tree.query(mesh.triangles_center)
++    keep = face_dists < 0.008
++    drop_frac = 1.0 - (mesh.area_faces[keep].sum() / max(mesh.area, 1e-9))
++    if drop_frac > 0.25 or keep.sum() < 20:
++        return {"_error": f"{cat}/{oid}: OakBase covers only {(1 - drop_frac)*100:.0f}%"}
++    if drop_frac > 0.01:
++        mesh = mesh.submesh([keep], append=True)
++
++    raw_max_ext = float(mesh.extents.max())
++    if raw_max_ext < 0.04 or raw_max_ext > 0.45:
++        return {"_error": f"{cat}/{oid}: extent {raw_max_ext:.3f}m out of [0.04, 0.45]"}
++
++    afford_flags = [is_affordance_part(cat, sn, at) for sn, at in zip(part_names, part_attrs)]
++    if not any(afford_flags):
++        afford_flags = ["held_by_hand" in at for at in part_attrs]
++    if not any(afford_flags):
++        afford_flags[0] = True
++    afford_part_names = [sn for sn, f in zip(part_names, afford_flags) if f]
++
++    np.random.seed(abs(hash(oid)) % (2**32))
++    surf_pts, face_idx = trimesh.sample.sample_surface(mesh, n_pts)
++    surf_normals = np.asarray(mesh.face_normals[face_idx], dtype=np.float32)
++    _, nn_idx = tree.query(surf_pts)
++    surf_part_ids = all_part_ids[nn_idx]
++    surf_afford = np.isin(surf_part_ids, [i for i, f in enumerate(afford_flags) if f])
++
++    T_canon = canonicalize_transform(surf_pts, surf_afford)
++    R = T_canon[:3, :3]
++    t = T_canon[:3, 3]
++
++    mesh_canon = mesh.copy()
++    mesh_canon.apply_transform(T_canon)
++    pts_canon = (surf_pts @ R.T + t).astype(np.float32)
++    normals_canon = (surf_normals @ R.T).astype(np.float32)
++    n_norm = np.linalg.norm(normals_canon, axis=1, keepdims=True)
++    normals_canon = normals_canon / np.maximum(n_norm, 1e-8)
++
++    obj_out.mkdir(parents=True, exist_ok=True)
++    visual_path = obj_out / "visual.obj"
++    mesh_canon.export(visual_path)
++
++    col_dir = obj_out / "collision"
++    try:
++        hull_parts = run_coacd(
++            visual_path,
++            col_dir,
++            max_convex_hull=max_hull,
++            threshold=threshold,
++            preprocess_resolution=30,
++            resolution=1200,
++            mcts_nodes=15,
++            mcts_iterations=100,
++            mcts_max_depth=3,
++            mode="python",
++        )
++    except Exception as e:
++        return {"_error": f"{cat}/{oid}: CoACD failed: {e}"}
++
++    if not hull_parts:
++        return {"_error": f"{cat}/{oid}: CoACD returned 0 parts"}
++
++    col_files = sorted(col_dir.glob("decomp_*.obj"))
++    col_rels = [f"collision/{f.name}" for f in col_files]
++    mass = build_urdf(urdf_path, f"{cat}_{oid}", "visual.obj", col_rels, hull_parts)
++
++    extents = mesh_canon.extents.astype(np.float32)
++    min_z = float(mesh_canon.bounds[0, 2])
++    init_z_offset = float(-min_z + 0.005)
++
++    np.savez_compressed(
++        cloud_path,
++        points=pts_canon,
++        normals=normals_canon,
++        part_ids=surf_part_ids.astype(np.int64),
++        afford_mask=surf_afford.astype(np.float32),
++        extents=extents,
++    )
++
++    meta = {
++        "category": cat,
++        "oakbase_cat": ob_cat,
++        "obj_id": oid,
++        "name": name,
++        "urdf_path": str(urdf_path),
++        "cloud_path": str(cloud_path),
++        "part_names": part_names,
++        "afford_parts": afford_part_names,
++        "T_canon": T_canon.tolist(),
++        "extents": extents.tolist(),
++        "init_z_offset": init_z_offset,
++        "mass": mass,
++        "num_hulls": len(col_rels),
++    }
++    with open(meta_path, "w") as f:
++        json.dump(meta, f, indent=2)
++    return meta
++
++
++def discover_objects(categories: list[str], max_per_cat: int) -> list[tuple[str, str, str, str]]:
++    meta_r = json.load(open(os.path.join(SHAPE_DIR, "metaV2", "object_id.json")))
++    meta_v = json.load(open(os.path.join(SHAPE_DIR, "metaV2", "virtual_object_id.json")))
++    all_meta = {**meta_r, **meta_v}
++
++    tasks = []
++    for cat in categories:
++        cd = os.path.join(SHAPE_DIR, "oakink_shape_v2", cat)
++        if not os.path.isdir(cd):
++            print(f"[warn] category not in oakink_shape_v2: {cat}")
++            continue
++        ob_cat = resolve_oakbase_cat(cat)
++        real_oids = sorted(
++            {p.split(os.sep)[-3] for p in glob.glob(os.path.join(cd, "*", "*", "hand_param.pkl"))}
++        )
++        virt_oids = sorted(
++            {
++                p.split(os.sep)[-2]
++                for p in glob.glob(os.path.join(cd, "*", "*", "*", "hand_param.pkl"))
++            }
++            - set(real_oids)
++        )
++        ordered = real_oids + virt_oids
++        chosen = []
++        for oid in ordered:
++            if oid not in all_meta:
++                continue
++            name = all_meta[oid]["name"]
++            if not glob.glob(os.path.join(OAKBASE_DIR, ob_cat, name, "part_*.json")):
++                continue
++            chosen.append((cat, ob_cat, oid, name))
++            if max_per_cat > 0 and len(chosen) >= max_per_cat:
++                break
++        print(f"[discover] {cat:16s} -> {len(chosen):3d} objects (real={min(len(real_oids), len(chosen))})")
++        tasks.extend(chosen)
++    return tasks
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--out_dir", default="/home/szc/data/simtoolreal_oakink_assets")
++    p.add_argument("--categories", nargs="+", default=list(DEFAULT_TOOL_CATEGORIES))
++    p.add_argument("--max_per_cat", type=int, default=16)
++    p.add_argument("--n_pts", type=int, default=256)
++    p.add_argument("--max_hull", type=int, default=32)
++    p.add_argument("--threshold", type=float, default=0.05)
++    p.add_argument("--workers", type=int, default=8)
++    args = p.parse_args()
++
++    out_dir = Path(args.out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    raw_tasks = discover_objects(args.categories, args.max_per_cat)
++    full_tasks = [
++        (cat, ob_cat, oid, name, str(out_dir), args.n_pts, args.max_hull, args.threshold)
++        for cat, ob_cat, oid, name in raw_tasks
++    ]
++
++    assets = []
++    errors = []
++    with ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("spawn")) as ex:
++        futs = [ex.submit(process_one_object, t) for t in full_tasks]
++        for i, fut in enumerate(as_completed(futs), 1):
++            res = fut.result()
++            if res is None:
++                continue
++            if "_error" in res:
++                errors.append(res["_error"])
++            else:
++                assets.append(res)
++            if i % 20 == 0 or i == len(full_tasks):
++                print(f"[progress] {i}/{len(full_tasks)} ok={len(assets)} skipped={len(errors)}")
++
++    assets.sort(key=lambda a: (a["category"], a["obj_id"]))
++    categories_present = sorted({a["category"] for a in assets})
++    cat_to_id = {c: i for i, c in enumerate(categories_present)}
++
++    pts_list, nrm_list, pid_list, aff_list, ext_list, zoff_list, cid_list = [], [], [], [], [], [], []
++    for a in assets:
++        d = np.load(a["cloud_path"])
++        pts_list.append(d["points"])
++        nrm_list.append(d["normals"])
++        pid_list.append(d["part_ids"])
++        aff_list.append(d["afford_mask"])
++        ext_list.append(a["extents"])
++        zoff_list.append(a["init_z_offset"])
++        cid_list.append(cat_to_id[a["category"]])
++        a["category_id"] = cat_to_id[a["category"]]
++
++    clouds_pt = out_dir / "asset_clouds.pt"
++    torch.save(
++        {
++            "points": torch.from_numpy(np.stack(pts_list)).float(),
++            "normals": torch.from_numpy(np.stack(nrm_list)).float(),
++            "part_ids": torch.from_numpy(np.stack(pid_list)).long(),
++            "afford_mask": torch.from_numpy(np.stack(aff_list)).float(),
++            "extents": torch.tensor(ext_list, dtype=torch.float32),
++            "init_z_offset": torch.tensor(zoff_list, dtype=torch.float32),
++            "category_id": torch.tensor(cid_list, dtype=torch.long),
++            "categories": categories_present,
++        },
++        clouds_pt,
++    )
++
++    manifest = {
++        "out_dir": str(out_dir),
++        "clouds_pt": str(clouds_pt),
++        "n_pts": args.n_pts,
++        "categories": categories_present,
++        "num_assets": len(assets),
++        "assets": assets,
++    }
++    manifest_path = out_dir / "manifest.json"
++    with open(manifest_path, "w") as f:
++        json.dump(manifest, f, indent=2)
++
++    print(f"\n[done] wrote {manifest_path} ({len(assets)} assets across {len(categories_present)} categories)")
++    for c in categories_present:
++        n_c = sum(1 for a in assets if a["category"] == c)
++        print(f"  {c:16s}: {n_c}")
++    if errors:
++        print(f"[skipped {len(errors)}]:", errors[:8])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
+index 310bd760..1535c44b 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
+@@ -10,7 +10,7 @@ import torch
+ from isaaclab.utils.math import random_orientation
+ 
+ from .action_utils import sample_log_uniform
+-from .goal_sampling import sample_absolute_goal_pose, sample_delta_goal_pose
++from .goal_sampling import sample_absolute_goal_pose, sample_delta_goal_pose, sample_human_like_trajectories
+ from .obs_utils import KEYPOINT_CORNERS, NUM_FINGERTIPS
+ from .scene_utils import (
+     ARM_JOINT_REGEX,
+@@ -110,8 +110,16 @@ def allocate_state_buffers(env) -> None:
+         env.num_envs, dtype=torch.long, device=env.device
+     )
+ 
+-    # --- Tolerance curriculum state ---
++    # --- Tolerance / grasp-score curriculum state ---
+     env._current_success_tolerance: float = env.cfg.termination.success_tolerance
++    start_thr = float(getattr(env.cfg.termination, "grasp_score_threshold_start", 0.0))
++    env._current_grasp_score_threshold: float = start_thr
++    cats = getattr(env, "_asset_categories", None)
++    num_cats = len(cats) if cats else 1
++    env._current_grasp_score_threshold_per_cat = torch.full(
++        (num_cats,), start_thr, dtype=torch.float32, device=env.device
++    )
++    env._last_curriculum_update_per_cat = [0] * num_cats
+     env._prev_episode_successes = torch.zeros(
+         env.num_envs, dtype=torch.long, device=env.device
+     )
+@@ -165,6 +173,9 @@ def allocate_state_buffers(env) -> None:
+     env._curr_fingertip_distances = torch.zeros(
+         env.num_envs, NUM_FINGERTIPS, device=env.device
+     )
++    env._pos_near_goal = torch.zeros(
++        env.num_envs, dtype=torch.bool, device=env.device
++    )
+     env._near_goal = torch.zeros(
+         env.num_envs, dtype=torch.bool, device=env.device
+     )
+@@ -193,6 +204,13 @@ def allocate_state_buffers(env) -> None:
+         env._traj_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+         env._traj_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+ 
++    if getattr(env.cfg.reset, "human_like_goals", False):
++        H = int(env.cfg.reset.human_like_goal_horizon)
++        env._human_traj_pos = torch.zeros(env.num_envs, H, 3, device=env.device)
++        env._human_traj_quat = torch.zeros(env.num_envs, H, 4, device=env.device)
++        env._human_traj_quat[..., 0] = 1.0
++        env._human_traj_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
++
+     # set the reward buffer to 0
+     env.reward_buf = torch.zeros(env.num_envs, device=env.device)
+ 
+@@ -278,6 +296,25 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
+         fixed = torch.as_tensor(cfg.fixed_start_pose, device=env.device, dtype=torch.float32)
+         pos_local = fixed[:3].unsqueeze(0).expand(n, -1)
+         quat = fixed[3:].unsqueeze(0).expand(n, -1)
++    elif getattr(env, "_asset_init_z_offset", None) is not None and getattr(cfg, "human_like_goals", False):
++        # Rest tool flat on the table (canonical Z is thinnest axis; table top is table_z + 0.15m)
++        noise = torch.empty(n, 3, device=env.device).uniform_(-1.0, 1.0)
++        asset_idx = env._object_asset_index_per_env[env_ids]
++        z_off = env._asset_init_z_offset[asset_idx]
++        pos_local = torch.stack(
++            (
++                noise[:, 0] * cfg.reset_position_noise_x,
++                noise[:, 1] * cfg.reset_position_noise_y,
++                env._table_z_per_env[env_ids] + 0.15 + z_off + 0.01 + noise[:, 2].abs() * 0.01,
++            ),
++            dim=-1,
++        )
++        # Random yaw in [-60, +60] deg so the tool lies flat and reachable on the table
++        yaw = torch.empty(n, device=env.device).uniform_(-1.05, 1.05)
++        quat = torch.stack(
++            [torch.cos(yaw * 0.5), torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw * 0.5)],
++            dim=-1,
++        )
+     else:
+         noise = torch.empty(n, 3, device=env.device).uniform_(-1.0, 1.0)
+         pos_local = torch.stack(
+@@ -342,6 +379,37 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
+         env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
+         return
+ 
++    if getattr(cfg, "human_like_goals", False):
++        H = env._human_traj_pos.shape[1]
++        if mode == "absolute":
++            if getattr(env, "_asset_category_ids", None) is not None:
++                cids = env._asset_category_ids[env._object_asset_index_per_env[env_ids]]
++                cats = env._asset_categories
++            else:
++                cids = torch.zeros(n, dtype=torch.long, device=env.device)
++                cats = ["hammer"]
++            t_pos, t_quat = sample_human_like_trajectories(
++                category_ids=cids,
++                categories=cats,
++                num_steps=H,
++                mins=cfg.target_volume_mins,
++                maxs=cfg.target_volume_maxs,
++                yaw_range_deg=float(cfg.human_like_yaw_range_deg),
++                scale_range=tuple(float(x) for x in cfg.human_like_scale_range),
++                device=env.device,
++            )
++            env._human_traj_pos[env_ids] = t_pos
++            env._human_traj_quat[env_ids] = t_quat
++            env._human_traj_step[env_ids] = 0
++        else:
++            env._human_traj_step[env_ids] = (env._human_traj_step[env_ids] + 1) % H
++        step_idx = env._human_traj_step[env_ids]
++        new_pos_local = env._human_traj_pos[env_ids, step_idx]
++        new_quat = env._human_traj_quat[env_ids, step_idx]
++        pose = torch.cat([new_pos_local + env_origins, new_quat], dim=-1)
++        env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
++        return
++
+     if mode == "delta":
+         prev_pos_local = env.goal_viz.data.root_pos_w[env_ids] - env_origins
+         prev_quat = env.goal_viz.data.root_quat_w[env_ids]
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
+index f8c0ea5c..7a764c2f 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ 
+ import torch
+ 
++from .grasp_score_utils import grasp_score_reward
++
+ 
+ def lifting_reward(
+     object_z: torch.Tensor,            # (N,)
+@@ -104,7 +106,13 @@ def compute_rewards(env) -> torch.Tensor:
+         lifting_bonus=rew_cfg.lifting_bonus,
+         lifting_rew_scale=rew_cfg.lifting_rew_scale,
+     )
++    interval = getattr(rew_cfg, "grasp_score_interval", 0)
++    if interval and interval > 0:
++        score_mask = (env.episode_length_buf > 0) & (env.episode_length_buf % interval == 0)
++    else:
++        score_mask = new_lifted & ~env._lifted_object
+     env._lifted_object = new_lifted
++    grasp_rew = grasp_score_reward(env, score_mask)
+ 
+     ft_rew, new_closest_ft = distance_delta_reward(
+         curr_fingertip_dist=env._curr_fingertip_distances,
+@@ -138,7 +146,7 @@ def compute_rewards(env) -> torch.Tensor:
+         force_consecutive=term_cfg.force_consecutive_near_goal_steps,
+     )
+ 
+-    reward = lift_rew + lift_bonus_rew + ft_rew + kp_rew + kuka_pen + hand_pen + bonus
++    reward = lift_rew + lift_bonus_rew + ft_rew + kp_rew + kuka_pen + hand_pen + bonus + grasp_rew
+     env._reward_terms = {
+         "fingertip_delta_rew": ft_rew,
+         "lifting_rew": lift_rew,
+@@ -147,6 +155,8 @@ def compute_rewards(env) -> torch.Tensor:
+         "kuka_actions_penalty": kuka_pen,
+         "hand_actions_penalty": hand_pen,
+         "bonus_rew": bonus,
++        "grasp_score_rew": grasp_rew,
++        **env._grasp_terms,
+         "total_reward": reward,
+     }
+ 
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py
+index 9cef4317..c55a8f40 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/scene_utils.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import math
+ import shutil
+ import tempfile
+@@ -210,6 +211,37 @@ def _student_camera_data_types(modality: str) -> list[str]:
+     )
+ 
+ 
++def tint_goal_viz_green(env) -> None:
++    """Tint GoalViz target-pose meshes opaque bright green for visual distinction."""
++    if getattr(env, "num_envs", 0) > 256:
++        return
++
++    from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
++
++    stage = get_current_stage()
++    mat_path = "/World/Looks/GoalVizGreen"
++    mat = UsdShade.Material.Define(stage, mat_path)
++    shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
++    shader.CreateIdAttr("UsdPreviewSurface")
++    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.10, 0.90, 0.25))
++    shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.05, 0.30, 0.10))
++    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.35)
++    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
++    mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
++
++    goal_viz_paths = find_matching_prim_paths("/World/envs/env_.*/GoalViz")
++    for prim_path in goal_viz_paths:
++        prim = stage.GetPrimAtPath(prim_path)
++        if not prim.IsValid():
++            continue
++        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
++            mat, bindingStrength=UsdShade.Tokens.strongerThanDescendants
++        )
++        for desc in Usd.PrimRange(prim):
++            if desc.IsA(UsdGeom.Gprim):
++                UsdGeom.Gprim(desc).CreateDisplayColorAttr([(0.10, 0.90, 0.25)])
++
++
+ def hide_goal_viz_for_student_camera(env) -> None:
+     cfg = getattr(env.cfg, "student_obs", None)
+     if cfg is None or not cfg.enabled or not cfg.hide_goal_viz:
+@@ -1668,7 +1700,38 @@ def setup_scene(env) -> None:
+     # 1. Resolve the object pool: a single named URDF (DexToolBench eval) or
+     #    procedural URDFs generated in a per-launch temp dir.
+     env._tmp_asset_dir = tempfile.mkdtemp(prefix="simtoolreal_assets_")
+-    if assets_cfg.object_urdf:
++    env._asset_clouds = None
++    env._asset_categories = []
++    env._asset_category_ids = None
++    env._asset_init_z_offset = None
++    env._asset_manifest_assets = None
++    usd_cache_dir = None
++
++    if getattr(assets_cfg, "dataset_manifest", ""):
++        manifest_path = Path(assets_cfg.dataset_manifest)
++        if not manifest_path.exists():
++            raise FileNotFoundError(f"dataset_manifest not found: {manifest_path}")
++        manifest = json.load(open(manifest_path))
++        m_assets = manifest["assets"]
++        urdf_paths = [Path(a["urdf_path"]) for a in m_assets]
++        # Normalized bbox scale for backward-compat obs/keypoints (base_size=0.08m)
++        object_scales_normalized = [
++            tuple(float(v) / 0.08 for v in a["extents"]) for a in m_assets
++        ]
++        clouds = torch.load(manifest["clouds_pt"], map_location="cpu", weights_only=False)
++        env._asset_clouds = clouds
++        env._asset_categories = list(clouds["categories"])
++        env._asset_category_ids = clouds["category_id"].to(env.device)
++        env._asset_init_z_offset = clouds["init_z_offset"].to(env.device)
++        env._asset_manifest_assets = m_assets
++        usd_cache_dir = Path(manifest["out_dir"]) / "usd_cache"
++        usd_cache_dir.mkdir(parents=True, exist_ok=True)
++        _log_scene_step(
++            setup_t0,
++            f"loaded dataset_manifest {manifest_path} ({len(urdf_paths)} assets, "
++            f"{len(env._asset_categories)} categories)",
++        )
++    elif assets_cfg.object_urdf:
+         if assets_cfg.object_scale is None:
+             raise ValueError(
+                 "cfg.assets.object_scale must be set when object_urdf is given "
+@@ -1694,9 +1757,10 @@ def setup_scene(env) -> None:
+     _log_scene_step(setup_t0, f"generated {len(urdf_paths)} object URDFs")
+ 
+     # 2. Convert URDFs -> raw USDs -> role-specific baked USDs.
+-    usd_work_dir = Path(env._tmp_asset_dir) / "usd"
+-    bake_root = Path(env._tmp_asset_dir) / "baked_usd"
++    usd_work_dir = (usd_cache_dir / "usd") if usd_cache_dir is not None else (Path(env._tmp_asset_dir) / "usd")
++    bake_root = (usd_cache_dir / "baked_usd") if usd_cache_dir is not None else (Path(env._tmp_asset_dir) / "baked_usd")
+     usd_work_dir.mkdir(parents=True, exist_ok=True)
++    bake_root.mkdir(parents=True, exist_ok=True)
+ 
+     object_raw_usds = [
+         _convert_urdf_to_usd(
+@@ -1816,6 +1880,7 @@ def setup_scene(env) -> None:
+     env.scene.rigid_objects["table"] = env.table
+     env.scene.rigid_objects["object"] = env.object
+     env.scene.rigid_objects["goal_viz"] = env.goal_viz
++    tint_goal_viz_green(env)
+     hide_goal_viz_for_student_camera(env)
+     setup_student_camera(env)
+     _log_scene_step(setup_t0, "registered assets with scene")
+diff --git a/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py
+index 4960d133..341a068a 100644
+--- a/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py
++++ b/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py
+@@ -8,9 +8,57 @@ from .reset_utils import reset_goal_trackers
+ 
+ 
+ def update_tolerance_curriculum(env) -> None:
+-    """Shrink success tolerance when completed episodes average enough goals."""
++    """Update tolerance curriculum, or grasp-score threshold curriculum when enabled."""
+     env._frame_counter += 1
+     term = env.cfg.termination
++    use_score_curr = bool(getattr(term, "use_grasp_score_curriculum", False))
++
++    if use_score_curr:
++        # Keep position tolerance fixed at the configured medium-loose value.
++        env._current_success_tolerance = float(term.success_tolerance)
++
++        thr_per_cat = getattr(env, "_current_grasp_score_threshold_per_cat", None)
++        cat_ids_per_asset = getattr(
++            env, "_grasp_asset_cat_ids", getattr(env, "_asset_category_ids", None)
++        )
++        if (
++            thr_per_cat is not None
++            and cat_ids_per_asset is not None
++            and getattr(env, "_object_asset_index_per_env", None) is not None
++        ):
++            env_cat_ids = cat_ids_per_asset[env._object_asset_index_per_env]
++            last_upd = getattr(env, "_last_curriculum_update_per_cat", None)
++            if last_upd is None or len(last_upd) != int(thr_per_cat.numel()):
++                last_upd = [0] * int(thr_per_cat.numel())
++                env._last_curriculum_update_per_cat = last_upd
++            all_succ = env._prev_episode_successes.float()
++            eligible_mask = (
++                env._curriculum_eligible_mask()
++                if hasattr(env, "_curriculum_eligible_mask")
++                else None
++            )
++            threshold = term.tolerance_curriculum_success_threshold
++            if hasattr(env, "_curriculum_success_threshold"):
++                custom_threshold = env._curriculum_success_threshold()
++                if custom_threshold is not None:
++                    threshold = float(custom_threshold)
++            step_inc = float(term.grasp_score_threshold_step)
++            max_thr = float(term.grasp_score_threshold_max)
++            for cid in range(int(thr_per_cat.numel())):
++                if env._frame_counter - last_upd[cid] < term.tolerance_curriculum_interval:
++                    continue
++                m = env_cat_ids == cid
++                if eligible_mask is not None:
++                    m = m & eligible_mask
++                if m.any() and all_succ[m].mean().item() >= threshold:
++                    new_thr = min(float(thr_per_cat[cid].item()) + step_inc, max_thr)
++                    thr_per_cat[cid] = round(new_thr, 6)
++                    last_upd[cid] = env._frame_counter
++            env._current_grasp_score_threshold = float(thr_per_cat.mean().item())
++            if term.eval_success_tolerance is not None:
++                env._current_success_tolerance = float(term.eval_success_tolerance)
++            return
++
+     if env._frame_counter - env._last_curriculum_update >= term.tolerance_curriculum_interval:
+         successes = env._prev_episode_successes.float()
+         eligible_mask = None
+@@ -26,9 +74,17 @@ def update_tolerance_curriculum(env) -> None:
+                 threshold = float(custom_threshold)
+ 
+         if successes.numel() > 0 and successes.mean().item() >= threshold:
+-            new_tol = env._current_success_tolerance * term.tolerance_curriculum_increment
+-            new_tol = max(min(new_tol, term.success_tolerance), term.target_success_tolerance)
+-            env._current_success_tolerance = new_tol
++            if use_score_curr:
++                cur_thr = float(getattr(env, "_current_grasp_score_threshold", 0.0))
++                new_thr = min(
++                    cur_thr + float(term.grasp_score_threshold_step),
++                    float(term.grasp_score_threshold_max),
++                )
++                env._current_grasp_score_threshold = round(new_thr, 6)
++            else:
++                new_tol = env._current_success_tolerance * term.tolerance_curriculum_increment
++                new_tol = max(min(new_tol, term.success_tolerance), term.target_success_tolerance)
++                env._current_success_tolerance = new_tol
+             env._last_curriculum_update = env._frame_counter
+ 
+     # Eval pins the success criterion.
+diff --git a/isaacsimenvs/utils/pointnet_network.py b/isaacsimenvs/utils/pointnet_network.py
+new file mode 100644
+index 00000000..7374ba60
+--- /dev/null
++++ b/isaacsimenvs/utils/pointnet_network.py
+@@ -0,0 +1,120 @@
++"""End-to-end PointNet Actor-Critic network builder for RL-Games (PPO & SAPG).
++
++Expects a flat observation vector laid out as:
++    [proprio (D_p) | object_pointcloud (N * C) | optional SAPG tail (D_t)]
++where `object_pointcloud` is placed as the LAST field of `obs_list` / `state_list`,
++and SAPG optionally appends its 1-column `pid_idx` / `coef_id_idx` at the very end.
++
++In `forward()`:
++  1. Slices out `proprio`, `cloud (B, N, C)`, and optional `tail`.
++  2. Encodes `cloud` with a permutation-invariant PointNet (shared MLP + MaxPool).
++  3. Applies LayerNorm to `proprio` (so `normalize_input: False` can be used without
++     breaking PointNet permutation invariance).
++  4. Concatenates `[proprio_norm, geo_feat, tail]` and delegates to `A2CBuilder.Network`
++     (LSTM + MLP + mu/sigma/value, including SAPG `extra_param` & `coef_cond`).
++"""
++
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++
++from rl_games.algos_torch.model_builder import register_network
++from rl_games.algos_torch.network_builder import A2CBuilder
++
++
++class PointNetEncoder(nn.Module):
++    def __init__(self, in_dim: int, units: list[int], out_dim: int):
++        super().__init__()
++        layers: list[nn.Module] = []
++        prev = in_dim
++        for h in units:
++            layers.append(nn.Linear(prev, h))
++            layers.append(nn.LayerNorm(h))
++            layers.append(nn.ELU(inplace=True))
++            prev = h
++        if prev != out_dim:
++            layers.append(nn.Linear(prev, out_dim))
++            layers.append(nn.LayerNorm(out_dim))
++            layers.append(nn.ELU(inplace=True))
++        self.mlp = nn.Sequential(*layers)
++
++    def forward(self, pts: torch.Tensor) -> torch.Tensor:
++        # pts: (B, N, C) -> (B, out_dim)
++        feat = self.mlp(pts)
++        return feat.max(dim=1).values
++
++
++class PointNetA2CBuilder(A2CBuilder):
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++
++    def load(self, params):
++        self.params = params
++
++    class Network(A2CBuilder.Network):
++        def __init__(self, params, **kwargs):
++            pn_cfg = params.get("pointnet", {})
++            self.pn_num_points = int(pn_cfg.get("num_points", 128))
++            self.pn_point_dim = int(pn_cfg.get("point_dim", 7))
++            self.pn_units = list(pn_cfg.get("units", [64, 128, 128]))
++            self.pn_out_dim = int(pn_cfg.get("out_dim", 128))
++            self.pn_flat_dim = self.pn_num_points * self.pn_point_dim
++
++            orig_shape = kwargs["input_shape"]
++            orig_dim = int(orig_shape[0])
++
++            # SAPG appends 1 column at the end (`pid_idx` / `coef_id_idx`) when present
++            has_pid = "pid_idx" in kwargs and kwargs["pid_idx"] is not None
++            has_coef = "coef_id_idx" in kwargs and kwargs["coef_id_idx"] is not None
++            tail_dim = 0
++            if has_pid:
++                tail_dim = max(tail_dim, orig_dim - int(kwargs["pid_idx"]))
++            if has_coef:
++                tail_dim = max(tail_dim, orig_dim - int(kwargs["coef_id_idx"]))
++
++            self.pn_proprio_dim = orig_dim - self.pn_flat_dim - tail_dim
++            if self.pn_proprio_dim < 0:
++                raise ValueError(
++                    f"PointNetA2CBuilder: input_shape={orig_shape} smaller than "
++                    f"pointcloud flat dim {self.pn_flat_dim} + tail {tail_dim}"
++                )
++
++            delta = self.pn_out_dim - self.pn_flat_dim
++            new_kwargs = dict(kwargs)
++            new_kwargs["input_shape"] = (orig_dim + delta,)
++            if has_pid:
++                new_kwargs["pid_idx"] = int(kwargs["pid_idx"]) + delta
++            if has_coef:
++                new_kwargs["coef_id_idx"] = int(kwargs["coef_id_idx"]) + delta
++
++            super().__init__(params, **new_kwargs)
++
++            self.proprio_ln = nn.LayerNorm(self.pn_proprio_dim)
++            self.pointnet = PointNetEncoder(self.pn_point_dim, self.pn_units, self.pn_out_dim)
++
++        def forward(self, obs_dict):
++            obs = obs_dict["obs"]
++            bsz = obs.shape[0]
++            p_end = self.pn_proprio_dim
++            c_end = p_end + self.pn_flat_dim
++
++            proprio = self.proprio_ln(obs[:, :p_end])
++            cloud = obs[:, p_end:c_end].reshape(bsz, self.pn_num_points, self.pn_point_dim)
++            geo = self.pointnet(cloud)
++
++            if c_end < obs.shape[1]:
++                tail = obs[:, c_end:]
++                packed = torch.cat([proprio, geo, tail], dim=-1)
++            else:
++                packed = torch.cat([proprio, geo], dim=-1)
++
++            new_obs_dict = dict(obs_dict)
++            new_obs_dict["obs"] = packed
++            return super().forward(new_obs_dict)
++
++    def build(self, name, **kwargs):
++        return PointNetA2CBuilder.Network(self.params, **kwargs)
++
++
++register_network("pointnet_actor_critic", PointNetA2CBuilder)
+diff --git a/isaacsimenvs/utils/wandb_utils.py b/isaacsimenvs/utils/wandb_utils.py
+index ed55601d..b4fb9e7f 100644
+--- a/isaacsimenvs/utils/wandb_utils.py
++++ b/isaacsimenvs/utils/wandb_utils.py
+@@ -75,7 +75,6 @@ class WandbAlgoObserver(AlgoObserver):
+                 id=wandb_unique_id,
+                 name=display_name,
+                 resume=True,
+-                settings=wandb.Settings(start_method="fork"),
+             )
+             wandb.run.log_code(root=logcode_dir)
+             print(f"[Wandb] run dir: {wandb.run.dir} (log_code root: {logcode_dir})")

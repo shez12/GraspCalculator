@@ -16,14 +16,19 @@ This version:
 
 ```
 graspcalc/
-  hands.py        HandState, MANOHand, URDFHand (+ URDFHandConfig)
-  factors.py      F1 hand shape, aligned-distance contact maps, soft IoU
-  oakink.py       OakInk-Shape loaders: real / transferred grasps, object meshes, support-plate removal
-  paths.py        default data paths (env vars OAKINK_SHAPE_DIR, OAKBASE_DIR, MANO_ROOT)
-  score_parts.py  main scorer: one reference -> whole category, OakBase part-aware contact
-  summarize.py    tables / box plots grouped by contacted parts and by intent
-  report.py       PDF report of one or more runs
-  bench.py        timing
+  hands.py                   HandState, MANOHand, URDFHand (+ URDFHandConfig)
+  factors.py                 F1 hand shape, aligned-distance contact maps, soft IoU
+  invariant_scorer.py        GPU-batched cross-hand morphology-invariant v2 scorer + 39D ref_feat
+  transformer_scorer.py      Reference-conditioned Transformer grasp scorer
+  train_transformer_scorer.py Training script for Transformer grasp scorer
+  oakink.py                  OakInk-Shape loaders: real / transferred grasps, object meshes, support-plate removal
+  paths.py                   default data paths (env vars OAKINK_SHAPE_DIR, OAKBASE_DIR, MANO_ROOT)
+  score_parts.py             main scorer: one reference -> whole category, OakBase part-aware contact
+  summarize.py               tables / box plots grouped by contacted parts and by intent
+  report.py                  PDF report of one or more runs
+  bench.py                   timing
+refs_by_cat/                 12-category mirrored left-hand OakInk functional references (index.json + *.pt)
+integrations/                SimToolReal Isaac Lab RL integration patch, launchers, and rollout helpers
 ```
 
 ## 2. Environment
@@ -230,3 +235,41 @@ Speed (reference contact cached, MANO forward included):
    Output: `outputs/grasp_score/<object>/<task>/grasp_scores.json` and `ep*_grasp.npz`.
 
 `graspcalc.robots.sharpa_ha4` holds the Sharpa link -> part map; `graspcalc.retarget.retarget` fits a URDF hand to a MANO grasp by keypoints (offline checks).
+
+---
+
+## 9. Invariant-v2 跨手打分器与 SimToolReal 端到端 RL 集成
+
+### 9.1 Invariant-v2 跨手形态不变打分器（`graspcalc/invariant_scorer.py`）
+
+为适配任意灵巧手（MANO、Sharpa HA4 及后续任意 URDF 灵巧手）并在 12,288 并行仿真环境中实时打分，v2 打分器完全基于无量纲几何与功能区接触特征：
+
+```text
+S_v2 = F1 * sigmoid((F4p - 0.32) / 0.08) * F4d * F_loc
+```
+
+- **`F1`（24 维形态不变手型特征）**：各手指弯曲余弦、归一化指尖间距、掌平面高度；
+- **`F4p`（功能区接触质量）**：功能区接触占比、主动参与手指选择、拇指-其余手指对向夹持与功能区纯度；
+- **`F4d`（`[6 手部功能组 × 2 物体部件]` 接触矩阵）**：软 IoU 与功能区存在性；
+- **`F_loc`（功能轴握持落点与朝向）**：沿功能轴（功能区质心 → 非功能区质心）的归一化坐标 `s_ax`、手部朝向与掌心朝向。
+
+同时，每个参考抓取预提取并缓存固定 **39 维跨手 `ref_feat`**（`InvariantGraspScorer.ref_feature_vector()`），供底层策略按每环境 ref 索引条件输入：
+- `24D` 形态不变手型特征（`ref_f1_feat`）
+- `12D` 展平的 `[6 × 2]` 参考接触矩阵（`ref_contact_mat`）
+- `3D` 功能轴落点与朝向（`[ref_s_ax, ref_ori_hand, ref_ori_palm]`）
+
+### 9.2 SimToolReal 观测与按类独立阈值课程（`integrations/simtoolreal_oakink_grasp_rl.patch`）
+
+- **8 维 PointNet 点云观测**（128 点 × 8 维 = 1024 维）：`[xyz_rel_palm (3), afford_mask (1), s_ax (1), goal_disp (3)]`，显式提供功能区掩码与沿功能轴归一化坐标 `s_ax`；
+- **39 维 `ref_feat` 条件观测**：按 per-env `ref_id` 索引读取，支持后续同物体多 ref 随机采样而无需改网络结构；
+- **按类独立 `score_threshold[cat]` 课程学习**：固定位置容差 `success_tolerance=0.075`，维护 `(num_cats,)` 张量阈值（`0.00 → 0.40`，步长 `0.05`）；每个类别独立达标升档，简单类自行往 `0.30 → 0.40` 爬坡，难类留在 `0.00` 先拿完基础抬起与到位奖励，达标后再各自升档；到位环境实时调用 `invariant_v2` 门控（阈值为 `0.0` 的类零额外算分开销），每 50 步叠加稠密 `grasp_score` 奖励（`scale=100.0`）。
+
+### 9.3 四阶段训练路线图（Roadmap）
+
+| 阶段 | 数据与配置 | 核心目标 | 过关标准 |
+|---|---|---|---|
+| **Stage 1：12 物体热身**（当前进行中） | 12 类各 1 个代表物体、单 ref、12,288 envs（4 batch/轮）、按类独立 `score_threshold[cat]` | 跑通 8 维点云 + 39 维 `ref_feat` + 阈值课程，避免初期小类梯度被淹没 | 12 类 `successes_cat` 均衡上升，`score_threshold` 稳步推高至 `0.30–0.40` |
+| **Stage 2：93 物体泛化** | 加载 Stage 1 ckpt，扩至全量 93 OakInk 物体 | 学跨实例几何泛化 | 93 已训练 + 33 未见物体上稳抓率与 v2 分（尤其是 `F_loc` / `F1`）显著高于旧策略 |
+| **Stage 3：一物多 ref 泛化** | 每类扩充多个 OakInk ref（`use / hold / handover / lift` 等），reset 随机采样 | 让底层策略真正学会“看 39 维 `ref_feat` 切手型”，而非死记类别 | 同一物体换不同 ref 时，手型与接触区随 ref 明显切换 |
+| **Stage 4：上层选择器 + 跨手复用** | 冻结底层 $\pi_{\text{low}}(a \mid \text{obs}, \text{ref\_feat})$ | 针对不同下游任务，用轻量网络 / VLM / 分层 RL 输出 39 维 `ref_feat` 选抓法 | 换任务只换上层选择器；换新灵巧手时打分器、39 维接口与上层全部复用，仅重训底层 |
+
