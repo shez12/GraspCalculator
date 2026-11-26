@@ -273,3 +273,62 @@ S_v2 = F1 * sigmoid((F4p - 0.32) / 0.08) * F4d * F_loc
 | **Stage 3：一物多 ref 泛化** | 每类扩充多个 OakInk ref（`use / hold / handover / lift` 等），reset 随机采样 | 让底层策略真正学会“看 39 维 `ref_feat` 切手型”，而非死记类别 | 同一物体换不同 ref 时，手型与接触区随 ref 明显切换 |
 | **Stage 4：上层选择器 + 跨手复用** | 冻结底层 $\pi_{\text{low}}(a \mid \text{obs}, \text{ref\_feat})$ | 针对不同下游任务，用轻量网络 / VLM / 分层 RL 输出 39 维 `ref_feat` 选抓法 | 换任务只换上层选择器；换新灵巧手时打分器、39 维接口与上层全部复用，仅重训底层 |
 
+### 9.4 从零复现当前实验（Step-by-Step Reproduction）
+
+前提：已安装 Isaac Sim / Isaac Lab 环境（Python 3.11 + PyTorch + `rl_games`），并下载好 OakInk-Shape 与 OakBase 数据集（参见第 3 节）。
+
+```bash
+# 1. 拉取本仓库与指定基准版本的 SimToolReal，并打上端到端 RL 集成补丁
+git clone https://github.com/shez12/GraspCalculator.git
+git clone https://github.com/tylerlum/simtoolreal.git
+cd simtoolreal
+git checkout 313d5aea1f507c6cfe097b672b62945d7b0bbff5
+git apply ../GraspCalculator/integrations/simtoolreal_oakink_grasp_rl.patch
+
+# 2. 生成全量 93 个 OakInk 物体资产（URDF / 凸分解碰撞体 / 256 点云与功能区掩码）
+export OAKINK_SHAPE_DIR=/path/to/OakInk/shape
+export OAKBASE_DIR=/path/to/OakInk/OakBase
+export OAKINK_ASSETS_DIR=/path/to/simtoolreal_oakink_assets
+
+PYTHONPATH="$PWD:../GraspCalculator" python isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py \
+  --out_dir "${OAKINK_ASSETS_DIR}" \
+  --max_per_cat 16 --n_pts 256 --max_hull 32 --workers 8
+
+# 3. 切出 Stage 1 12 物体子集 manifest（每类 1 个与 refs_by_cat/index.json 对应的代表物体）
+python ../GraspCalculator/integrations/make_stage1_manifest.py \
+  --full_manifest "${OAKINK_ASSETS_DIR}/manifest.json" \
+  --ref_index ../GraspCalculator/refs_by_cat/index.json \
+  --out_manifest "${OAKINK_ASSETS_DIR}/manifest_12cat_1each.json" \
+  --out_clouds "${OAKINK_ASSETS_DIR}/clouds_12cat_1each.pt"
+
+# 4. 启动 Stage 1 训练（12,288 envs, 8D PointNet + 39D ref_feat + 按类独立 score_threshold[cat] 课程）
+#    - 从零开始训练直接运行即可；若需从已有权重热启动，额外传 CKPT=/path/to/model.pth
+#    - 若显存较小（如 24–48 GB），可下调 NUM_ENVS=4096 MINIBATCH_SIZE=16384 EXPL_BLOCK_SIZE=1024
+SIMTOOLREAL_DIR="$PWD" \
+GRASPCALC_DIR="$(cd ../GraspCalculator && pwd)" \
+OAKINK_ASSETS_DIR="${OAKINK_ASSETS_DIR}" \
+PYTHON="$(which python)" \
+bash ../GraspCalculator/integrations/run_train_oakink_stage1_12obj_8d_ref39_percat_curr_n12288.sh
+
+# 5. 查看训练曲线（本地 TensorBoard，重点看 score_threshold_cat/*、successes_cat/*、pos_near_rate_cat/*）
+python -m tensorboard.main \
+  --logdir outputs/<date>/<time>/0_simtoolreal_pointnet_sapg/summaries \
+  --host 0.0.0.0 --port 6006
+
+# 6. 评测 12 类随机/确定性 rollout 表现（统计抬起率、到位率、成功帧 v2 四项分量）
+OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH="$PWD:../GraspCalculator" \
+python ../GraspCalculator/integrations/eval_stage1_rollout.py \
+  --checkpoint outputs/<date>/<time>/0_simtoolreal_pointnet_sapg/last/model.pth \
+  --manifest "${OAKINK_ASSETS_DIR}/manifest_12cat_1each.json" \
+  --ref_dir ../GraspCalculator/refs_by_cat \
+  --trials_per_obj 16 --steps 600 --threshold 0.20
+
+# 7. （可选）后台定时录制与训练对齐的 rollout 视频（绿色目标位 + 随机策略 + 门控）
+SIMTOOLREAL_DIR="$PWD" GRASPCALC_DIR="$(cd ../GraspCalculator && pwd)" PYTHON="$(which python)" \
+bash ../GraspCalculator/integrations/watch_rollout_video.sh \
+  outputs/<date>/<time> 900 "${OAKINK_ASSETS_DIR}/manifest_12cat_1each.json"
+```
+
+> **Stage 2 切换方式**：Stage 1 达标后，只需将 `MANIFEST="${OAKINK_ASSETS_DIR}/manifest.json"` 并传入 `CKPT=outputs/<stage1>/last/model.pth`，复用同一启动脚本即可无缝扩展至全量 93 个 OakInk 物体。
+
+

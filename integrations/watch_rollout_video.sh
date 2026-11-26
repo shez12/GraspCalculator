@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
+# Periodic rollout video recorder aligned with training (stochastic policy,
+# 8D PointNet + 39D ref_feat, grasp-score gate, LSTM reset on dones).
 set -u
+
 RUN_DIR="${1:?pass run dir as first arg}"
-INTERVAL_SEC="${2:-900}"  # default: every 15 minutes
-FULL_MANIFEST="${3:-/home/szc/data/simtoolreal_oakink_assets/manifest_12cat_1each.json}"
+INTERVAL_SEC="${2:-900}"
+FULL_MANIFEST="${3:?pass dataset manifest json as third arg}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GRASPCALC_DIR="${GRASPCALC_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+SIMTOOLREAL_DIR="${SIMTOOLREAL_DIR:-${PWD}}"
+REF_DIR="${REF_DIR:-${GRASPCALC_DIR}/refs_by_cat}"
+PYTHON="${PYTHON:-python}"
+GRASP_SCORE_THRESHOLD="${GRASP_SCORE_THRESHOLD:-0.20}"
+
 CKPT_DIR="${RUN_DIR}/0_simtoolreal_pointnet_sapg"
 VID_DIR="${RUN_DIR}/videos"
 TMP_MANIFEST="/tmp/rollout_asset_manifest_$$.json"
@@ -23,14 +34,14 @@ while true; do
   if [ -n "${CKPT}" ] && [ -f "${CKPT}" ]; then
     MTIME=$(stat -c %Y "${CKPT}" 2>/dev/null || echo 0)
     if [ "${MTIME}" -gt "${LAST_MTIME}" ]; then
-      ASSET_TAG=$(/home/szc/.conda/envs/simtoolreal_isaacsim/bin/python /home/szc/.cache/pick_random_oakink_asset.py "${FULL_MANIFEST}" "${TMP_MANIFEST}" "${TMP_CLOUDS}")
+      ASSET_TAG=$("${PYTHON}" "${SCRIPT_DIR}/pick_random_oakink_asset.py" "${FULL_MANIFEST}" "${TMP_MANIFEST}" "${TMP_CLOUDS}")
       TS=$(date +%Y%m%d_%H%M%S)
       OUT="${VID_DIR}/rollout_${TS}_${ASSET_TAG}.mp4"
       echo "[watcher] $(date '+%F %T') asset=${ASSET_TAG} recording ${CKPT} -> ${OUT}"
-      cd /home/szc/work/newsimtoolreal/simtoolreal
+      cd "${SIMTOOLREAL_DIR}"
       OMNI_KIT_ACCEPT_EULA=YES \
-      PYTHONPATH="/home/szc/work/newsimtoolreal/simtoolreal:/home/szc/work/graspcalculator:${PYTHONPATH:-}" \
-      /home/szc/.conda/envs/simtoolreal_isaacsim/bin/python -u isaacsimenvs/play_video.py \
+      PYTHONPATH="${SIMTOOLREAL_DIR}:${GRASPCALC_DIR}:${PYTHONPATH:-}" \
+      "${PYTHON}" -u isaacsimenvs/play_video.py \
         --checkpoint "${CKPT}" \
         --task Isaacsimenvs-SimToolReal-Direct-v0 \
         --agent rl_games_pointnet_sapg_cfg_entry_point \
@@ -40,10 +51,10 @@ while true; do
         --human_like_goals \
         --use_pointcloud_obs \
         --use_grasp_ref_feat \
-        --grasp_score_ref_dir /home/szc/work/graspcalculator/refs_by_cat \
+        --grasp_score_ref_dir "${REF_DIR}" \
         --grasp_score_backend invariant_v2 \
         --use_grasp_score_curriculum \
-        --grasp_score_threshold 0.20 \
+        --grasp_score_threshold "${GRASP_SCORE_THRESHOLD}" \
         --clean_env \
         --out "${OUT}"
       if [ -f "${OUT}" ]; then
