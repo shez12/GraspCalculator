@@ -355,6 +355,29 @@ index 14b12f4f..cd710ee9 100644
 +from .utils import pointnet_network  # noqa: F401  side effect: register_network("pointnet_actor_critic")
  
  __all__ = ["tasks"]
+diff --git a/isaacsimenvs/cfg/task/SimToolReal.yaml b/isaacsimenvs/cfg/task/SimToolReal.yaml
+index 6469d468..0154d1b5 100644
+--- a/isaacsimenvs/cfg/task/SimToolReal.yaml
++++ b/isaacsimenvs/cfg/task/SimToolReal.yaml
+@@ -127,14 +127,14 @@ reset:
+ # -----------------------------------------------------------------------------
+ termination:
+   episode_length: 600                 # policy steps (600 * 2 * 1/120 = 10s)
+-  success_tolerance: 0.075            # curriculum start
+-  target_success_tolerance: 0.01      # curriculum floor
++  success_tolerance: 0.06             # curriculum start (6.0 cm pos when decoupled)
++  target_success_tolerance: 0.04      # curriculum floor (4.0 cm pos when decoupled)
+   eval_success_tolerance: null
+   success_steps: 10
+   max_consecutive_successes: 50
+-  force_consecutive_near_goal_steps: false
++  force_consecutive_near_goal_steps: true
+   tolerance_curriculum_increment: 0.9
+-  tolerance_curriculum_interval: 3000
++  tolerance_curriculum_interval: 10000
+ 
+ # -----------------------------------------------------------------------------
+ # 8) domain_randomization — sim2real essentials (delays, noise, impulses)
 diff --git a/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml b/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml
 new file mode 100644
 index 00000000..5ecfd710
