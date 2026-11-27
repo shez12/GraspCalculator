@@ -1284,7 +1284,7 @@ index 823b1091..ea051901 100644
  
  __all__ = ["log_step_metrics"]
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
-index ffd8ff96..c27aa555 100644
+index ffd8ff96..b3f2fcb9 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
 @@ -51,9 +51,120 @@ OBS_FIELD_SIZES: dict[str, int] = {
@@ -1438,7 +1438,7 @@ index ffd8ff96..c27aa555 100644
  
      if rew_cfg.fixed_size_keypoint_reward:
          kp_offsets = env._keypoint_offsets_fixed
-@@ -189,11 +317,70 @@ def compute_intermediate_values(env) -> None:
+@@ -189,11 +317,76 @@ def compute_intermediate_values(env) -> None:
          sentinel_ft, env._curr_fingertip_distances, env._closest_fingertip_dist
      )
  
@@ -1464,8 +1464,14 @@ index ffd8ff96..c27aa555 100644
 +    # P0-3: require object to be lifted off the table before near-goal / success can trigger.
 +    if getattr(term_cfg, "use_decoupled_pose_tolerance", False) and not hasattr(env, "_keypoint_success_tolerance_m"):
 +        pos_err = torch.norm(obj_pos - goal_pos, dim=-1)
-+        dot = torch.clamp(torch.abs((obj_rot * goal_rot).sum(dim=-1)), 0.0, 1.0)
-+        rot_err = 2.0 * torch.acos(dot)
++        # Principal-axis (+X) alignment angle (roll-invariant around +X), matching
++        # anisotropic fixed_size keypoints so upright power_drill / spinning tools are not rejected.
++        x_axis = torch.zeros_like(obj_pos)
++        x_axis[:, 0] = 1.0
++        obj_x = quat_apply(obj_rot, x_axis)
++        goal_x = quat_apply(goal_rot, x_axis)
++        cos_ang = torch.clamp((obj_x * goal_x).sum(dim=-1), -1.0, 1.0)
++        rot_err = torch.acos(cos_ang)
 +        rot_tol_rad = float(getattr(term_cfg, "success_rot_tolerance_deg", 60.0)) * (3.141592653589793 / 180.0)
 +        pos_near = (pos_err <= base_tol) & (rot_err <= rot_tol_rad) & env._lifted_object
 +    else:
@@ -1513,7 +1519,7 @@ index ffd8ff96..c27aa555 100644
      env._near_goal_steps = update_near_goal_steps(
          near_goal=env._near_goal,
          near_goal_steps=env._near_goal_steps,
-@@ -336,6 +523,23 @@ def build_observations(env) -> dict[str, torch.Tensor]:
+@@ -336,6 +529,23 @@ def build_observations(env) -> dict[str, torch.Tensor]:
              joint_vel + torch.randn_like(joint_vel) * dr.joint_velocity_obs_noise_std
          )
  

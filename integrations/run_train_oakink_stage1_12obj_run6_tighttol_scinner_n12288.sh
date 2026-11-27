@@ -35,7 +35,7 @@ exec /home/szc/.conda/envs/simtoolreal_isaacsim/bin/python isaacsimenvs/train.py
   env.domain_randomization.force_prob_range=[0.0,0.0] \
   env.domain_randomization.torque_prob_range=[0.0,0.0] \
   env.termination.use_grasp_score_curriculum=True \
-  env.termination.success_tolerance=0.075 \
+  env.termination.success_tolerance=0.06 \
   env.termination.grasp_score_threshold_start=0.0 \
   env.termination.grasp_score_threshold_step=0.05 \
   env.termination.grasp_score_threshold_max=0.60 \
