@@ -217,6 +217,9 @@ def _contact_and_axis_batched(
     v2 = fingers["little"][:, 0] - wrist
     n_palm = F.normalize(torch.cross(v1, v2, dim=-1), dim=-1) * float(sign)
     ori_palm = (n_palm * a_hat).sum(dim=-1)
+    # Lateral palm axis (pinky -> index/thumb): prevents 180-deg backwards tool grasps
+    u_lat = F.normalize(fingers["index"][:, 0] - fingers["little"][:, 0], dim=-1)
+    ori_lat = (u_lat * a_hat).sum(dim=-1)
 
     return dict(
         mat=mat,
@@ -227,6 +230,7 @@ def _contact_and_axis_batched(
         s_ax=s_ax,
         ori_hand=ori_hand,
         ori_palm=ori_palm,
+        ori_lat=ori_lat,
     )
 
 
@@ -271,6 +275,7 @@ class InvariantGraspScorer:
             self.ref_s_ax = float(fr["s_ax"].item())
             self.ref_ori_hand = float(fr["ori_hand"].item())
             self.ref_ori_palm = float(fr["ori_palm"].item())
+            self.ref_ori_lat = float(fr["ori_lat"].item())
 
     def ref_feature_vector(self) -> torch.Tensor:
         """Return dimensionless 39-dim morphology-invariant reference vector:
@@ -355,11 +360,15 @@ class InvariantGraspScorer:
         presence_aff = torch.clamp(fc["max_aff"] / 0.5, max=1.0)
         f4d = soft_iou * presence_aff
 
-        # F_loc: generalizable 1D functional-axis position & orientation
+        # F_loc: generalizable 1D functional-axis position & 3-axis hand orientation (incl. ori_lat)
         if self.ref_has_axis:
             d_s = (fc["s_ax"] - self.ref_s_ax).abs()
-            d_ori = 0.5 * ((fc["ori_hand"] - self.ref_ori_hand).pow(2) + (fc["ori_palm"] - self.ref_ori_palm).pow(2))
-            f_loc_raw = torch.exp(-(d_s / 0.35).pow(2)) * torch.exp(-d_ori / 0.65)
+            d_ori = (
+                (fc["ori_hand"] - self.ref_ori_hand).pow(2)
+                + (fc["ori_palm"] - self.ref_ori_palm).pow(2)
+                + (fc["ori_lat"] - self.ref_ori_lat).pow(2)
+            ) / 3.0
+            f_loc_raw = torch.exp(-(d_s / 0.35).pow(2)) * torch.exp(-d_ori / 0.35)
             f_loc = torch.where(fc["has_axis"], f_loc_raw, torch.ones_like(f_loc_raw))
         else:
             f_loc = torch.ones_like(f1)
