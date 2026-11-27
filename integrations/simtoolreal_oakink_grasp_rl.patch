@@ -357,10 +357,10 @@ index 14b12f4f..cd710ee9 100644
  __all__ = ["tasks"]
 diff --git a/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml b/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml
 new file mode 100644
-index 00000000..70f56277
+index 00000000..5ecfd710
 --- /dev/null
 +++ b/isaacsimenvs/cfg/train/SimToolRealPointNetSAPG.yaml
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,133 @@
 +# SimToolReal end-to-end PointNet + LSTM + MLP SAPG training config.
 +# Replaces bounding-box keypoints/scales with a 128-point object point cloud
 +# (xyz_rel_palm + affordance_mask + goal_disp) encoded end-to-end by PointNet.
@@ -427,6 +427,9 @@ index 00000000..70f56277
 +    normalize_value: True
 +    value_bootstrap: True
 +    normalize_advantage: True
++    per_cat_advantage_norm: False
++    per_cat_advantage_floor_ratio: 0.2
++    per_cat_advantage_clip: 8.0
 +    reward_shaper:
 +      scale_value: 0.01
 +    num_actors: ${....env.scene.num_envs}
@@ -660,7 +663,7 @@ index 42c03361..00f4c367 100644
      def _setup_scene(self) -> None:
          setup_scene(self)
 diff --git a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
-index 892f03c4..59a7baf8 100644
+index 892f03c4..bdb2f025 100644
 --- a/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
 +++ b/isaacsimenvs/tasks/simtoolreal/simtoolreal_env_cfg.py
 @@ -76,6 +76,8 @@ class AssetsCfg:
@@ -710,28 +713,54 @@ index 892f03c4..59a7baf8 100644
 +    # Human-like category-aware functional tool-use goal trajectories
 +    human_like_goals: bool = False
 +    human_like_goal_horizon: int = 32
-+    human_like_yaw_range_deg: float = 30.0
++    human_like_yaw_range_deg: float = 15.0
 +    human_like_scale_range: tuple[float, float] = (0.85, 1.15)
 +
  
  # ----------------------------------------------------------------------------
  # termination (includes tolerance curriculum — governs success criterion)
-@@ -443,6 +468,13 @@ class TerminationCfg:
-     tolerance_curriculum_interval: int = 3000  # env steps across all agents
-     tolerance_curriculum_success_threshold: float = 3.0
+@@ -430,18 +455,33 @@ class TerminationCfg:
  
-+    # Grasp-score threshold curriculum: fixes success_tolerance and raises
-+    # required live grasp_score_v2 when pos_near (d_max <= tol) holds.
+     episode_length: int = 600  # steps (policy steps; 600 * decimation * dt = 10s)
+ 
+-    success_tolerance: float = 0.075  # curriculum start
+-    target_success_tolerance: float = 0.01  # curriculum floor
++    success_tolerance: float = 0.06  # curriculum start (6.0 cm pos when decoupled)
++    target_success_tolerance: float = 0.04  # curriculum floor (4.0 cm pos when decoupled)
+     eval_success_tolerance: float | None = None
++    use_decoupled_pose_tolerance: bool = True
++    success_rot_tolerance_deg: float = 60.0
+ 
+     success_steps: int = 10
+     max_consecutive_successes: int = 50
+-    force_consecutive_near_goal_steps: bool = False
++    force_consecutive_near_goal_steps: bool = True
+ 
+-    # Tolerance curriculum (the only curriculum in v1).
++    # Tolerance / grasp-score curriculum pacing.
+     tolerance_curriculum_increment: float = 0.9  # multiplicative per step
+-    tolerance_curriculum_interval: int = 3000  # env steps across all agents
+-    tolerance_curriculum_success_threshold: float = 3.0
++    tolerance_curriculum_interval: int = 10000  # env steps (~312 epochs min dwell per tier)
++    tolerance_curriculum_success_threshold: float = 10.0
++
++    # Grasp-score threshold curriculum: starts at `success_tolerance` and raises
++    # required live grasp_score_v2 when pos_near (d_max <= tol) holds. Once a
++    # category hits `grasp_score_threshold_max`, optionally tightens its
++    # per-category tolerance down toward `target_success_tolerance`.
 +    use_grasp_score_curriculum: bool = False
 +    grasp_score_threshold_start: float = 0.0
 +    grasp_score_threshold_step: float = 0.05
 +    grasp_score_threshold_max: float = 0.40
-+
++    tighten_tolerance_after_score_max: bool = True
++    # Optional path to a JSON file (or inline JSON dict) mapping category name -> initial threshold,
++    # used to preserve per-category curriculum progress across restarts.
++    grasp_score_threshold_init_by_cat: str = ""
+ 
  
  # ----------------------------------------------------------------------------
- # domain_randomization
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py b/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py
-index 73a091e4..38cff6b7 100644
+index 73a091e4..159d2b40 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/goal_sampling.py
 @@ -1,4 +1,4 @@
@@ -831,17 +860,17 @@ index 73a091e4..38cff6b7 100644
 +
 +        if cat == "hammer":
 +            # Variant 0: swing_down (vertical strike arc); Variant 1: swing_side (lateral arc)
-+            down_dx = -0.07 * c_amp * torch.sin(c_u)
++            down_dx = -0.06 * c_amp * torch.sin(c_u)
 +            down_dy = 0.02 * c_amp * torch.sin(c_u)
-+            down_dz = 0.06 * c_amp * torch.cos(c_u)
-+            down_pitch = 0.65 * torch.sin(c_u)
++            down_dz = 0.05 * c_amp * torch.cos(c_u)
++            down_pitch = 0.30 * torch.sin(c_u)
 +            down_yaw = torch.zeros_like(c_u)
 +
-+            side_dx = 0.06 * c_amp * torch.sin(c_u)
-+            side_dy = 0.07 * c_amp * torch.cos(c_u)
++            side_dx = 0.05 * c_amp * torch.sin(c_u)
++            side_dy = 0.06 * c_amp * torch.cos(c_u)
 +            side_dz = 0.02 * c_amp * torch.sin(c_u)
 +            side_pitch = torch.zeros_like(c_u)
-+            side_yaw = 0.55 * torch.sin(c_u)
++            side_yaw = 0.25 * torch.sin(c_u)
 +
 +            dx[m] = torch.where(c_var, side_dx, down_dx)
 +            dy[m] = torch.where(c_var, side_dy, down_dy)
@@ -851,31 +880,31 @@ index 73a091e4..38cff6b7 100644
 +            yaw[m] = torch.where(c_var, side_yaw, down_yaw)
 +
 +        elif cat in ("screwdriver", "wrench"):
-+            # Spin around tool long axis (+X): vertical (pointed down) or horizontal
-+            base_pitch = torch.where(c_var, torch.full_like(c_u, 0.0), torch.full_like(c_u, 1.25))
++            # Gentle wrist turn within left-hand comfortable kinematic range
++            base_pitch = torch.where(c_var, torch.full_like(c_u, 0.0), torch.full_like(c_u, 0.35))
 +            dx[m] = 0.015 * c_amp * torch.sin(c_u)
 +            dy[m] = 0.015 * c_amp * torch.cos(c_u)
 +            dz[m] = 0.02 * c_amp * torch.sin(0.5 * c_u)
-+            roll[m] = 1.45 * torch.sin(2.0 * c_u)
++            roll[m] = 0.40 * torch.sin(2.0 * c_u)
 +            pitch[m] = base_pitch
-+            yaw[m] = 0.1 * torch.sin(c_u)
++            yaw[m] = 0.10 * torch.sin(c_u)
 +
 +        elif cat in ("pen", "marker", "toothbrush"):
-+            # Writing / brushing: tilted tip down ~35 deg, smooth arc / figure-8 in XY
-+            dx[m] = 0.08 * c_amp * torch.sin(c_u)
++            # Writing / brushing: mild tilt (~17 deg), smooth arc in XY, keep above table
++            dx[m] = 0.07 * c_amp * torch.sin(c_u)
 +            dy[m] = 0.05 * c_amp * torch.sin(2.0 * c_u)
-+            dz[m] = -0.02 + 0.015 * c_amp * torch.cos(2.0 * c_u)
-+            roll[m] = 0.15 * torch.sin(c_u)
-+            pitch[m] = 0.60 + 0.10 * torch.sin(c_u)
-+            yaw[m] = 0.20 * torch.sin(c_u)
++            dz[m] = 0.015 * c_amp * torch.cos(2.0 * c_u)
++            roll[m] = 0.12 * torch.sin(c_u)
++            pitch[m] = 0.30 + 0.08 * torch.sin(c_u)
++            yaw[m] = 0.15 * torch.sin(c_u)
 +
 +        elif cat in ("knife", "scissors", "pincer"):
-+            # Slicing / cutting: back-and-forth along tool axis with slight pitch rocking
-+            dx[m] = 0.08 * c_amp * torch.sin(2.0 * c_u)
++            # Slicing / cutting: back-and-forth along tool axis with gentle pitch rocking, keep above table
++            dx[m] = 0.07 * c_amp * torch.sin(2.0 * c_u)
 +            dy[m] = 0.025 * c_amp * torch.sin(c_u)
-+            dz[m] = -0.02 + 0.025 * c_amp * torch.cos(2.0 * c_u)
++            dz[m] = 0.02 * c_amp * torch.cos(2.0 * c_u)
 +            roll[m] = 0.0
-+            pitch[m] = 0.22 * torch.sin(2.0 * c_u)
++            pitch[m] = 0.18 * torch.sin(2.0 * c_u)
 +            yaw[m] = 0.15 * torch.sin(c_u)
 +
 +        elif cat == "fryingpan":
@@ -883,8 +912,8 @@ index 73a091e4..38cff6b7 100644
 +            dx[m] = 0.06 * c_amp * torch.sin(c_u)
 +            dy[m] = 0.04 * c_amp * torch.cos(c_u)
 +            dz[m] = 0.04 * c_amp * torch.sin(2.0 * c_u)
-+            roll[m] = 0.15 * torch.sin(c_u)
-+            pitch[m] = -0.25 * torch.sin(2.0 * c_u)
++            roll[m] = 0.12 * torch.sin(c_u)
++            pitch[m] = -0.18 * torch.sin(2.0 * c_u)
 +            yaw[m] = 0.15 * torch.sin(c_u)
 +
 +        elif cat in ("power_drill", "trigger_sprayer", "flashlight"):
@@ -893,8 +922,8 @@ index 73a091e4..38cff6b7 100644
 +            dy[m] = 0.06 * c_amp * torch.sin(c_u)
 +            dz[m] = 0.03 * c_amp * torch.cos(c_u)
 +            roll[m] = 0.0
-+            pitch[m] = 0.12 + 0.12 * torch.sin(c_u)
-+            yaw[m] = 0.30 * torch.sin(c_u)
++            pitch[m] = 0.10 + 0.10 * torch.sin(c_u)
++            yaw[m] = 0.20 * torch.sin(c_u)
 +
 +    # Rotate local XY displacement by per-env yaw_off and add anchor
 +    cy = torch.cos(yaw_off).unsqueeze(1)
@@ -1217,10 +1246,10 @@ index 00000000..e3bb67c4
 +        rew[ids] = env.cfg.reward.grasp_score_rew_scale * r["total"]
 +    return rew
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py
-index 823b1091..8853256f 100644
+index 823b1091..ea051901 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/logging_utils.py
-@@ -29,5 +29,30 @@ def log_step_metrics(env) -> None:
+@@ -29,5 +29,33 @@ def log_step_metrics(env) -> None:
      env.extras["successes"] = env._prev_episode_successes.float()
      env.extras["current_success_tolerance"] = float(env._current_success_tolerance)
  
@@ -1238,6 +1267,7 @@ index 823b1091..8853256f 100644
 +        asset_clouds = getattr(env, "_asset_clouds", None)
 +        cat_ids_per_asset = getattr(env, "_grasp_asset_cat_ids", None)
 +        thr_per_cat = getattr(env, "_current_grasp_score_threshold_per_cat", None)
++        tol_per_cat = getattr(env, "_current_success_tolerance_per_cat", None)
 +        if asset_clouds is not None and "categories" in asset_clouds and cat_ids_per_asset is not None:
 +            env_cat_ids = cat_ids_per_asset[env._object_asset_index_per_env]
 +            for cid, cname in enumerate(asset_clouds["categories"]):
@@ -1248,11 +1278,13 @@ index 823b1091..8853256f 100644
 +                    env.extras[f"successes_cat/{cname}"] = float(prev_succ_f[m].mean().item())
 +                    if thr_per_cat is not None and cid < int(thr_per_cat.numel()):
 +                        env.extras[f"score_threshold_cat/{cname}"] = float(thr_per_cat[cid].item())
++                    if tol_per_cat is not None and cid < int(tol_per_cat.numel()):
++                        env.extras[f"success_tolerance_cat/{cname}"] = float(tol_per_cat[cid].item())
 +
  
  __all__ = ["log_step_metrics"]
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
-index ffd8ff96..a4392362 100644
+index ffd8ff96..c27aa555 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/obs_utils.py
 @@ -51,9 +51,120 @@ OBS_FIELD_SIZES: dict[str, int] = {
@@ -1376,12 +1408,72 @@ index ffd8ff96..a4392362 100644
  def compute_obs_dim(field_list) -> int:
      """Return total tensor dim for an ordered list of obs field names."""
      return sum(OBS_FIELD_SIZES[f] for f in field_list)
-@@ -193,7 +304,43 @@ def compute_intermediate_values(env) -> None:
-         tol = env._keypoint_success_tolerance_m()
+@@ -165,9 +276,26 @@ def compute_intermediate_values(env) -> None:
+ 
+     ft_state = env.robot.data.body_state_w[:, env._fingertip_body_ids, :]
+     ft_pos = ft_state[:, :, 0:3] - env_origins.unsqueeze(1)
+-    env._curr_fingertip_distances = torch.norm(
+-        ft_pos - obj_pos.unsqueeze(1), dim=-1
+-    )  # (N, 5)
++    ft_dist_center = torch.norm(ft_pos - obj_pos.unsqueeze(1), dim=-1)  # (N, 5)
++    # P0-1: guide fingertips toward the functional affordance surface (afford_mask > 0.5)
++    # instead of the object geometric/mass center (critical for L-shaped tools like trigger_sprayer/power_drill).
++    if getattr(env, "_asset_clouds", None) is not None and getattr(env, "_object_asset_index_per_env", None) is not None:
++        pts_a, aff_a, _ = _ensure_obs_pointcloud_buffers(env)  # (A, 128, 3), (A, 128, 1)
++        idx_a = env._object_asset_index_per_env
++        pts_local = pts_a[idx_a]  # (N, 128, 3)
++        aff_bool = aff_a[idx_a].squeeze(-1) > 0.5  # (N, 128)
++        has_aff = aff_bool.any(dim=-1)  # (N,)
++        pts_w = quat_apply(
++            obj_rot.unsqueeze(1).expand(-1, pts_local.shape[1], -1), pts_local
++        ) + obj_pos.unsqueeze(1)
++        d_ft_pts = torch.cdist(ft_pos, pts_w)  # (N, 5, 128)
++        d_ft_pts = d_ft_pts.masked_fill(~aff_bool.unsqueeze(1), 1e6)
++        ft_dist_aff = d_ft_pts.min(dim=-1).values  # (N, 5)
++        env._curr_fingertip_distances = torch.where(
++            has_aff.unsqueeze(1), ft_dist_aff, ft_dist_center
++        )
++    else:
++        env._curr_fingertip_distances = ft_dist_center
+ 
+     if rew_cfg.fixed_size_keypoint_reward:
+         kp_offsets = env._keypoint_offsets_fixed
+@@ -189,11 +317,70 @@ def compute_intermediate_values(env) -> None:
+         sentinel_ft, env._curr_fingertip_distances, env._closest_fingertip_dist
+     )
+ 
+-    if hasattr(env, "_keypoint_success_tolerance_m"):
+-        tol = env._keypoint_success_tolerance_m()
++    tol_per_cat = getattr(env, "_current_success_tolerance_per_cat", None)
++    cat_ids_per_asset = getattr(
++        env, "_grasp_asset_cat_ids", getattr(env, "_asset_category_ids", None)
++    )
++    if (
++        getattr(term_cfg, "use_grasp_score_curriculum", False)
++        and term_cfg.eval_success_tolerance is None
++        and tol_per_cat is not None
++        and cat_ids_per_asset is not None
++        and getattr(env, "_object_asset_index_per_env", None) is not None
++    ):
++        base_tol = tol_per_cat[cat_ids_per_asset[env._object_asset_index_per_env]]
      else:
-         tol = env._current_success_tolerance * rew_cfg.keypoint_scale
+-        tol = env._current_success_tolerance * rew_cfg.keypoint_scale
 -    env._near_goal = env._keypoints_max_dist <= tol
-+    pos_near = env._keypoints_max_dist <= tol
++        base_tol = env._current_success_tolerance
++
++    # P0-3: require object to be lifted off the table before near-goal / success can trigger.
++    if getattr(term_cfg, "use_decoupled_pose_tolerance", False) and not hasattr(env, "_keypoint_success_tolerance_m"):
++        pos_err = torch.norm(obj_pos - goal_pos, dim=-1)
++        dot = torch.clamp(torch.abs((obj_rot * goal_rot).sum(dim=-1)), 0.0, 1.0)
++        rot_err = 2.0 * torch.acos(dot)
++        rot_tol_rad = float(getattr(term_cfg, "success_rot_tolerance_deg", 60.0)) * (3.141592653589793 / 180.0)
++        pos_near = (pos_err <= base_tol) & (rot_err <= rot_tol_rad) & env._lifted_object
++    else:
++        if hasattr(env, "_keypoint_success_tolerance_m"):
++            tol = env._keypoint_success_tolerance_m()
++        else:
++            tol = base_tol * rew_cfg.keypoint_scale
++        pos_near = (env._keypoints_max_dist <= tol) & env._lifted_object
 +    env._pos_near_goal = pos_near
 +
 +    if getattr(term_cfg, "use_grasp_score_curriculum", False):
@@ -1421,7 +1513,7 @@ index ffd8ff96..a4392362 100644
      env._near_goal_steps = update_near_goal_steps(
          near_goal=env._near_goal,
          near_goal_steps=env._near_goal_steps,
-@@ -336,6 +483,23 @@ def build_observations(env) -> dict[str, torch.Tensor]:
+@@ -336,6 +523,23 @@ def build_observations(env) -> dict[str, torch.Tensor]:
              joint_vel + torch.randn_like(joint_vel) * dr.joint_velocity_obs_noise_std
          )
  
@@ -1447,7 +1539,7 @@ index ffd8ff96..a4392362 100644
  
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py b/isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py
 new file mode 100644
-index 00000000..60b3067e
+index 00000000..e843c25d
 --- /dev/null
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/prepare_oakink_assets.py
 @@ -0,0 +1,461 @@
@@ -1607,9 +1699,9 @@ index 00000000..60b3067e
 +    visual_rel: str,
 +    collision_rels: list[str],
 +    parts: list[trimesh.Trimesh],
-+    density: float = 400.0,
++    density: float = 200.0,
 +    min_mass: float = 0.05,
-+    max_mass: float = 0.35,
++    max_mass: float = 0.15,
 +) -> float:
 +    """Write an Isaac-Sim-ready URDF with explicit <mass> and <inertia>."""
 +    combined = trimesh.util.concatenate(parts)
@@ -1913,7 +2005,7 @@ index 00000000..60b3067e
 +if __name__ == "__main__":
 +    main()
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
-index 310bd760..1535c44b 100644
+index 310bd760..0b6fd77e 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
 @@ -10,7 +10,7 @@ import torch
@@ -1925,7 +2017,18 @@ index 310bd760..1535c44b 100644
  from .obs_utils import KEYPOINT_CORNERS, NUM_FINGERTIPS
  from .scene_utils import (
      ARM_JOINT_REGEX,
-@@ -110,8 +110,16 @@ def allocate_state_buffers(env) -> None:
+@@ -93,6 +93,10 @@ def allocate_state_buffers(env) -> None:
+     env._lifted_object = torch.zeros(
+         env.num_envs, dtype=torch.bool, device=env.device
+     )
++    # max lift height above object_init_z reached so far in the current episode (for delta lifting reward)
++    env._max_object_lift_z = torch.zeros(
++        env.num_envs, dtype=torch.float32, device=env.device
++    )
+     # the maximum distance between the object and the goal since the last goal reset
+     env._closest_keypoint_max_dist = torch.full(
+         (env.num_envs,), -1.0, device=env.device
+@@ -110,8 +114,46 @@ def allocate_state_buffers(env) -> None:
          env.num_envs, dtype=torch.long, device=env.device
      )
  
@@ -1936,14 +2039,44 @@ index 310bd760..1535c44b 100644
 +    env._current_grasp_score_threshold: float = start_thr
 +    cats = getattr(env, "_asset_categories", None)
 +    num_cats = len(cats) if cats else 1
++    env._current_success_tolerance_per_cat = torch.full(
++        (num_cats,), float(env.cfg.termination.success_tolerance), dtype=torch.float32, device=env.device
++    )
 +    env._current_grasp_score_threshold_per_cat = torch.full(
 +        (num_cats,), start_thr, dtype=torch.float32, device=env.device
 +    )
++    init_by_cat_spec = str(
++        getattr(env.cfg.termination, "grasp_score_threshold_init_by_cat", "") or ""
++    ).strip()
++    if init_by_cat_spec and cats:
++        import json
++        from pathlib import Path
++
++        spec_path = Path(init_by_cat_spec)
++        mapping = (
++            json.loads(spec_path.read_text())
++            if spec_path.is_file()
++            else json.loads(init_by_cat_spec)
++        )
++        for cid, cname in enumerate(cats):
++            if cname in mapping:
++                env._current_grasp_score_threshold_per_cat[cid] = float(mapping[cname])
++        env._current_grasp_score_threshold = float(
++            env._current_grasp_score_threshold_per_cat.mean().item()
++        )
++        print(
++            "[grasp_score_curr] Restored per-cat thresholds: "
++            + ", ".join(
++                f"{c}={env._current_grasp_score_threshold_per_cat[i].item():.2f}"
++                for i, c in enumerate(cats)
++            ),
++            flush=True,
++        )
 +    env._last_curriculum_update_per_cat = [0] * num_cats
      env._prev_episode_successes = torch.zeros(
          env.num_envs, dtype=torch.long, device=env.device
      )
-@@ -165,6 +173,9 @@ def allocate_state_buffers(env) -> None:
+@@ -165,6 +207,9 @@ def allocate_state_buffers(env) -> None:
      env._curr_fingertip_distances = torch.zeros(
          env.num_envs, NUM_FINGERTIPS, device=env.device
      )
@@ -1953,7 +2086,7 @@ index 310bd760..1535c44b 100644
      env._near_goal = torch.zeros(
          env.num_envs, dtype=torch.bool, device=env.device
      )
-@@ -193,6 +204,13 @@ def allocate_state_buffers(env) -> None:
+@@ -193,6 +238,13 @@ def allocate_state_buffers(env) -> None:
          env._traj_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
          env._traj_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
  
@@ -1967,7 +2100,7 @@ index 310bd760..1535c44b 100644
      # set the reward buffer to 0
      env.reward_buf = torch.zeros(env.num_envs, device=env.device)
  
-@@ -278,6 +296,25 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
+@@ -278,6 +330,25 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
          fixed = torch.as_tensor(cfg.fixed_start_pose, device=env.device, dtype=torch.float32)
          pos_local = fixed[:3].unsqueeze(0).expand(n, -1)
          quat = fixed[3:].unsqueeze(0).expand(n, -1)
@@ -1993,7 +2126,7 @@ index 310bd760..1535c44b 100644
      else:
          noise = torch.empty(n, 3, device=env.device).uniform_(-1.0, 1.0)
          pos_local = torch.stack(
-@@ -342,6 +379,37 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
+@@ -342,6 +413,37 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
          env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
          return
  
@@ -2031,11 +2164,19 @@ index 310bd760..1535c44b 100644
      if mode == "delta":
          prev_pos_local = env.goal_viz.data.root_pos_w[env_ids] - env_origins
          prev_quat = env.goal_viz.data.root_quat_w[env_ids]
+@@ -394,6 +496,7 @@ def reset_env_state(env, env_ids: torch.Tensor) -> None:
+ 
+     _clear_goal_trackers(env, env_ids)
+     env._lifted_object[env_ids] = False
++    env._max_object_lift_z[env_ids] = 0.0
+     env._successes[env_ids] = 0
+ 
+     env._action_queue[env_ids] = 0.0
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
-index f8c0ea5c..7a764c2f 100644
+index f8c0ea5c..8eb42fa1 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/reward_utils.py
-@@ -4,6 +4,8 @@ from __future__ import annotations
+@@ -4,23 +4,31 @@ from __future__ import annotations
  
  import torch
  
@@ -2044,10 +2185,51 @@ index f8c0ea5c..7a764c2f 100644
  
  def lifting_reward(
      object_z: torch.Tensor,            # (N,)
-@@ -104,7 +106,13 @@ def compute_rewards(env) -> torch.Tensor:
+     object_init_z: torch.Tensor,       # (N,)
+     prev_lifted: torch.Tensor,         # (N,) bool
++    max_lift_z: torch.Tensor,          # (N,)
+     lifting_bonus_threshold: float,
+     lifting_bonus: float,
+     lifting_rew_scale: float,
+-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Lift progress, one-shot lift bonus, and latched lifted state."""
+-    z_lift = 0.05 + object_z - object_init_z
+-    lift_rew = torch.clamp(z_lift, 0.0, 0.5)
+-    lifted = (z_lift > lifting_bonus_threshold) | prev_lifted
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Potential-based delta lift progress (no per-step tilt farming), one-shot lift bonus, and latched lifted state."""
++    lift_h = torch.clamp(object_z - object_init_z, 0.0, 0.5)
++    # Preserve the same physical lift height as legacy (0.05 + dz > 0.15 => dz > 0.10 m).
++    phys_thr = max(float(lifting_bonus_threshold) - 0.05, 0.01)
++    lifted = (lift_h > phys_thr) | prev_lifted
+     just_crossed = lifted & ~prev_lifted
+     lift_bonus = lifting_bonus * just_crossed.float()
+-    lift_rew = lift_rew * (~lifted).float()
+-    return lift_rew * lifting_rew_scale, lift_bonus, lifted
++    delta_lift = torch.clamp(lift_h - max_lift_z, 0.0, 0.5)
++    new_max_lift = torch.maximum(max_lift_z, lift_h)
++    # Scale delta lift (25x lifting_rew_scale = 500 at default 20) so 0->10cm gives +50 total,
++    # whereas tilting 3cm and holding gives only +15 once instead of +300..480 farmed over 300 steps.
++    lift_rew = delta_lift * (~lifted).float() * (lifting_rew_scale * 25.0)
++    return lift_rew, lift_bonus, lifted, new_max_lift
+ 
+ 
+ def distance_delta_reward(
+@@ -96,15 +104,23 @@ def compute_rewards(env) -> torch.Tensor:
+     env_origins = env.scene.env_origins
+     obj_pos = env.object.data.root_pos_w - env_origins
+ 
+-    lift_rew, lift_bonus_rew, new_lifted = lifting_reward(
++    lift_rew, lift_bonus_rew, new_lifted, new_max_lift = lifting_reward(
+         object_z=obj_pos[:, 2],
+         object_init_z=env._object_init_z,
+         prev_lifted=env._lifted_object,
++        max_lift_z=env._max_object_lift_z,
+         lifting_bonus_threshold=rew_cfg.lifting_bonus_threshold,
          lifting_bonus=rew_cfg.lifting_bonus,
          lifting_rew_scale=rew_cfg.lifting_rew_scale,
      )
++    env._max_object_lift_z = new_max_lift
 +    interval = getattr(rew_cfg, "grasp_score_interval", 0)
 +    if interval and interval > 0:
 +        score_mask = (env.episode_length_buf > 0) & (env.episode_length_buf % interval == 0)
@@ -2058,7 +2240,7 @@ index f8c0ea5c..7a764c2f 100644
  
      ft_rew, new_closest_ft = distance_delta_reward(
          curr_fingertip_dist=env._curr_fingertip_distances,
-@@ -138,7 +146,7 @@ def compute_rewards(env) -> torch.Tensor:
+@@ -138,7 +154,7 @@ def compute_rewards(env) -> torch.Tensor:
          force_consecutive=term_cfg.force_consecutive_near_goal_steps,
      )
  
@@ -2067,7 +2249,7 @@ index f8c0ea5c..7a764c2f 100644
      env._reward_terms = {
          "fingertip_delta_rew": ft_rew,
          "lifting_rew": lift_rew,
-@@ -147,6 +155,8 @@ def compute_rewards(env) -> torch.Tensor:
+@@ -147,6 +163,8 @@ def compute_rewards(env) -> torch.Tensor:
          "kuka_actions_penalty": kuka_pen,
          "hand_actions_penalty": hand_pen,
          "bonus_rew": bonus,
@@ -2188,10 +2370,10 @@ index 9cef4317..c55a8f40 100644
      setup_student_camera(env)
      _log_scene_step(setup_t0, "registered assets with scene")
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py
-index 4960d133..341a068a 100644
+index 4960d133..f6fb0bd2 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/termination_utils.py
-@@ -8,9 +8,57 @@ from .reset_utils import reset_goal_trackers
+@@ -8,9 +8,69 @@ from .reset_utils import reset_goal_trackers
  
  
  def update_tolerance_curriculum(env) -> None:
@@ -2202,10 +2384,9 @@ index 4960d133..341a068a 100644
 +    use_score_curr = bool(getattr(term, "use_grasp_score_curriculum", False))
 +
 +    if use_score_curr:
-+        # Keep position tolerance fixed at the configured medium-loose value.
-+        env._current_success_tolerance = float(term.success_tolerance)
-+
++        tighten_after_max = bool(getattr(term, "tighten_tolerance_after_score_max", False))
 +        thr_per_cat = getattr(env, "_current_grasp_score_threshold_per_cat", None)
++        tol_per_cat = getattr(env, "_current_success_tolerance_per_cat", None)
 +        cat_ids_per_asset = getattr(
 +            env, "_grasp_asset_cat_ids", getattr(env, "_asset_category_ids", None)
 +        )
@@ -2239,10 +2420,23 @@ index 4960d133..341a068a 100644
 +                if eligible_mask is not None:
 +                    m = m & eligible_mask
 +                if m.any() and all_succ[m].mean().item() >= threshold:
-+                    new_thr = min(float(thr_per_cat[cid].item()) + step_inc, max_thr)
-+                    thr_per_cat[cid] = round(new_thr, 6)
++                    cur_thr = float(thr_per_cat[cid].item())
++                    if cur_thr < max_thr - 1e-6:
++                        new_thr = min(cur_thr + step_inc, max_thr)
++                        thr_per_cat[cid] = round(new_thr, 6)
++                    elif tighten_after_max and tol_per_cat is not None and cid < int(tol_per_cat.numel()):
++                        cur_tol = float(tol_per_cat[cid].item())
++                        new_tol = max(
++                            min(cur_tol * term.tolerance_curriculum_increment, term.success_tolerance),
++                            term.target_success_tolerance,
++                        )
++                        tol_per_cat[cid] = round(new_tol, 6)
 +                    last_upd[cid] = env._frame_counter
 +            env._current_grasp_score_threshold = float(thr_per_cat.mean().item())
++            if tol_per_cat is not None:
++                env._current_success_tolerance = float(tol_per_cat.mean().item())
++            else:
++                env._current_success_tolerance = float(term.success_tolerance)
 +            if term.eval_success_tolerance is not None:
 +                env._current_success_tolerance = float(term.eval_success_tolerance)
 +            return
@@ -2250,7 +2444,7 @@ index 4960d133..341a068a 100644
      if env._frame_counter - env._last_curriculum_update >= term.tolerance_curriculum_interval:
          successes = env._prev_episode_successes.float()
          eligible_mask = None
-@@ -26,9 +74,17 @@ def update_tolerance_curriculum(env) -> None:
+@@ -26,9 +86,23 @@ def update_tolerance_curriculum(env) -> None:
                  threshold = float(custom_threshold)
  
          if successes.numel() > 0 and successes.mean().item() >= threshold:
@@ -2259,11 +2453,17 @@ index 4960d133..341a068a 100644
 -            env._current_success_tolerance = new_tol
 +            if use_score_curr:
 +                cur_thr = float(getattr(env, "_current_grasp_score_threshold", 0.0))
-+                new_thr = min(
-+                    cur_thr + float(term.grasp_score_threshold_step),
-+                    float(term.grasp_score_threshold_max),
-+                )
-+                env._current_grasp_score_threshold = round(new_thr, 6)
++                max_thr = float(term.grasp_score_threshold_max)
++                if cur_thr < max_thr - 1e-6:
++                    new_thr = min(
++                        cur_thr + float(term.grasp_score_threshold_step),
++                        max_thr,
++                    )
++                    env._current_grasp_score_threshold = round(new_thr, 6)
++                elif bool(getattr(term, "tighten_tolerance_after_score_max", False)):
++                    new_tol = env._current_success_tolerance * term.tolerance_curriculum_increment
++                    new_tol = max(min(new_tol, term.success_tolerance), term.target_success_tolerance)
++                    env._current_success_tolerance = round(new_tol, 6)
 +            else:
 +                new_tol = env._current_success_tolerance * term.tolerance_curriculum_increment
 +                new_tol = max(min(new_tol, term.success_tolerance), term.target_success_tolerance)
@@ -2271,6 +2471,253 @@ index 4960d133..341a068a 100644
              env._last_curriculum_update = env._frame_counter
  
      # Eval pins the success criterion.
+diff --git a/isaacsimenvs/train.py b/isaacsimenvs/train.py
+index 981f8321..25a5796b 100644
+--- a/isaacsimenvs/train.py
++++ b/isaacsimenvs/train.py
+@@ -92,6 +92,11 @@ def main() -> None:
+     parser.add_argument("--wandb_tags", nargs="*", default=[])
+     parser.add_argument("--wandb_notes", default="")
+     parser.add_argument("--wandb_logcode_dir", default="")
++    # --- clearml ---
++    parser.add_argument("--clearml_activate", action="store_true")
++    parser.add_argument("--clearml_project", default="simtoolreal_grasp_score")
++    parser.add_argument("--clearml_name", default="", help="Defaults to --wandb_name or agent_cfg.params.config.name")
++    parser.add_argument("--clearml_tags", nargs="*", default=[])
+     # --- AppLauncher flags (--headless, --enable_cameras, etc.) ---
+     AppLauncher.add_app_launcher_args(parser)
+     args_cli, hydra_args = parser.parse_known_args()
+@@ -205,7 +210,36 @@ def main() -> None:
+             )
+             observers.append(WandbAlgoObserver(wandb_cfg))
+ 
++        if args_cli.clearml_activate:
++            from clearml import Task
++
++            cml_name = (
++                args_cli.clearml_name
++                or args_cli.wandb_name
++                or agent_cfg["params"]["config"]["name"]
++            )
++            cml_task = Task.init(
++                project_name=args_cli.clearml_project,
++                task_name=cml_name,
++                tags=list(args_cli.clearml_tags) or None,
++                auto_connect_frameworks={"tensorboard": True, "matplotlib": True},
++            )
++            cml_task.connect(OmegaConf.to_container(OmegaConf.create(agent_cfg), resolve=True), name="agent_cfg")
++
+         runner = Runner(MultiObserver(observers))
++        # Optional per-category GAE advantage normalization + critic diagnostics
++        if agent_cfg["params"]["config"].get("per_cat_advantage_norm", False):
++            from isaacsimenvs.utils.cat_advantage import install_per_cat_advantage_hook
++
++            install_per_cat_advantage_hook(
++                env,
++                floor_ratio=float(
++                    agent_cfg["params"]["config"].get("per_cat_advantage_floor_ratio", 0.2)
++                ),
++                clip_val=float(
++                    agent_cfg["params"]["config"].get("per_cat_advantage_clip", 8.0)
++                ),
++            )
+         # Co-locate rl_games artifacts (checkpoints, summaries) with the Hydra
+         # run dir so slurm logs + config + videos all live together.
+         agent_cfg["params"]["config"]["train_dir"] = hydra_run_dir
+diff --git a/isaacsimenvs/utils/cat_advantage.py b/isaacsimenvs/utils/cat_advantage.py
+new file mode 100644
+index 00000000..3c810c3f
+--- /dev/null
++++ b/isaacsimenvs/utils/cat_advantage.py
+@@ -0,0 +1,188 @@
++"""Per-category GAE Advantage normalization and per-category Critic diagnostics.
++
++Hooks into RL-Games `ContinuousA2CBase` without modifying external `rl_games`:
++- `play_steps`: attaches `batch_dict["cat_ids"]` of shape `(N * T,)` so SAPG's
++  `augment_batch_for_mixed_expl` and `shuffle_batch` automatically keep category
++  IDs aligned 1-to-1 with `returns`, `values`, and `advantages`.
++- `prepare_dataset`:
++  1. Actor side: replaces global advantage normalization with per-category
++     group normalization:
++         A_hat_i = clamp((A_i - mu_{c(i)}) / max(sigma_{c(i)}, floor_ratio * sigma_global), -clip, clip)
++     with NO global re-scaling afterward.
++  2. Critic side: leaves critic loss untouched, and logs per-category
++     `value_loss_cat/<cat>`, `explained_var_cat/<cat>`, and raw `adv_std_cat/<cat>`
++     to TensorBoard every epoch.
++"""
++from __future__ import annotations
++
++import functools
++import torch
++
++
++def _resolve_env_categories(env) -> tuple[torch.Tensor | None, list[str]]:
++    raw = getattr(env, "unwrapped", env)
++    cats = list(getattr(raw, "_asset_categories", []) or [])
++    cat_ids_per_asset = getattr(
++        raw, "_grasp_asset_cat_ids", getattr(raw, "_asset_category_ids", None)
++    )
++    obj_idx = getattr(raw, "_object_asset_index_per_env", None)
++    if not cats or cat_ids_per_asset is None or obj_idx is None:
++        return None, []
++    env_cat_ids = cat_ids_per_asset[obj_idx].to(dtype=torch.long)
++    return env_cat_ids, cats
++
++
++def install_per_cat_advantage_hook(
++    env,
++    *,
++    floor_ratio: float = 0.2,
++    clip_val: float = 8.0,
++) -> bool:
++    """Install per-category advantage normalization + critic diagnostics on ContinuousA2CBase."""
++    env_cat_ids, categories = _resolve_env_categories(env)
++    if env_cat_ids is None or len(categories) <= 1:
++        print(
++            "[cat_advantage] Skipping install (single-category or no asset categories found).",
++            flush=True,
++        )
++        return False
++
++    from rl_games.common.a2c_common import ContinuousA2CBase
++
++    if getattr(ContinuousA2CBase, "_per_cat_adv_hooked", False):
++        return True
++
++    orig_play_steps = ContinuousA2CBase.play_steps
++    orig_prepare_dataset = ContinuousA2CBase.prepare_dataset
++
++    @functools.wraps(orig_play_steps)
++    def wrapped_play_steps(self, *args, **kwargs):
++        batch_dict, extras = orig_play_steps(self, *args, **kwargs)
++        n_envs = int(env_cat_ids.numel())
++        total_rows = int(batch_dict["returns"].shape[0])
++        if n_envs > 0 and total_rows % n_envs == 0:
++            horizon = total_rows // n_envs
++            # swap_and_flatten01 maps (T, N) -> (N, T) -> (N * T,), so env i occupies [i*T : (i+1)*T]
++            cids = (
++                env_cat_ids.to(device=batch_dict["returns"].device)
++                .unsqueeze(1)
++                .expand(n_envs, horizon)
++                .reshape(total_rows)
++            )
++            batch_dict["cat_ids"] = cids
++        return batch_dict, extras
++
++    @functools.wraps(orig_prepare_dataset)
++    def wrapped_prepare_dataset(self, batch_dict, train_value_mean_std=True):
++        cat_ids = batch_dict.pop("cat_ids", None)
++        if cat_ids is None or not self.normalize_advantage:
++            return orig_prepare_dataset(self, batch_dict, train_value_mean_std=train_value_mean_std)
++
++        obses = batch_dict["obses"]
++        returns = batch_dict["returns"]
++        dones = batch_dict["dones"]
++        values = batch_dict["values"]
++        actions = batch_dict["actions"]
++        neglogpacs = batch_dict["neglogpacs"]
++        mus = batch_dict["mus"]
++        sigmas = batch_dict["sigmas"]
++        rnn_states = batch_dict.get("rnn_states", None)
++        rnn_masks = batch_dict.get("rnn_masks", None)
++
++        advantages = returns - values
++
++        if self.normalize_value:
++            if train_value_mean_std:
++                self.value_mean_std.train()
++            values = self.value_mean_std(values)
++            returns = self.value_mean_std(returns)
++            self.value_mean_std.eval()
++
++        advantages = torch.sum(advantages, axis=1)
++
++        with torch.no_grad():
++            if rnn_masks is not None:
++                valid = rnn_masks.reshape(-1) > 0
++            else:
++                valid = torch.ones_like(advantages, dtype=torch.bool)
++
++            valid_adv = advantages[valid]
++            sigma_global = (
++                valid_adv.std(unbiased=False)
++                if valid_adv.numel() > 1
++                else torch.tensor(1.0, device=advantages.device, dtype=advantages.dtype)
++            )
++            sigma_floor = floor_ratio * sigma_global
++
++            adv_norm = torch.zeros_like(advantages)
++            v_pred_1d = values.reshape(-1)
++            v_ret_1d = returns.reshape(-1)
++            writer = getattr(self, "writer", None)
++            frame = int(getattr(self, "frame", 0))
++
++            for cid, cname in enumerate(categories):
++                m = (cat_ids == cid) & valid
++                if not m.any():
++                    continue
++                a_c = advantages[m]
++                mu_c = a_c.mean()
++                sigma_c = a_c.std(unbiased=False) if a_c.numel() > 1 else torch.zeros_like(mu_c)
++                denom_c = torch.maximum(sigma_c, sigma_floor) + 1e-8
++                norm_c = (a_c - mu_c) / denom_c
++                if clip_val > 0.0:
++                    norm_c = norm_c.clamp(-clip_val, clip_val)
++                adv_norm[m] = norm_c
++
++                if writer is not None:
++                    vp_c = v_pred_1d[m]
++                    vr_c = v_ret_1d[m]
++                    err_c = vr_c - vp_c
++                    v_loss_c = 0.5 * (err_c * err_c).mean().item()
++                    var_ret_c = vr_c.var(unbiased=False).item()
++                    var_err_c = err_c.var(unbiased=False).item()
++                    exp_var_c = 1.0 - var_err_c / (var_ret_c + 1e-8)
++                    writer.add_scalar(f"value_loss_cat/{cname}", float(v_loss_c), frame)
++                    writer.add_scalar(f"explained_var_cat/{cname}", float(exp_var_c), frame)
++                    writer.add_scalar(f"adv_std_cat/{cname}", float(sigma_c.item()), frame)
++
++            if writer is not None:
++                writer.add_scalar("adv_std_global", float(sigma_global.item()), frame)
++
++        dataset_dict = {
++            "old_values": values,
++            "old_logp_actions": neglogpacs,
++            "advantages": adv_norm,
++            "returns": returns,
++            "actions": actions,
++            "obs": obses,
++            "dones": dones,
++            "rnn_states": rnn_states,
++            "rnn_masks": rnn_masks,
++            "mu": mus,
++            "sigma": sigmas,
++            "off_policy_mask": batch_dict.get("off_policy_mask", None),
++        }
++        self.dataset.update_values_dict(dataset_dict)
++
++        if self.has_central_value:
++            cv_dict = {
++                "old_values": values,
++                "advantages": adv_norm,
++                "returns": returns,
++                "actions": actions,
++                "obs": batch_dict["states"],
++                "dones": dones,
++                "rnn_masks": rnn_masks,
++            }
++            self.central_value_net.update_dataset(cv_dict)
++
++    ContinuousA2CBase.play_steps = wrapped_play_steps
++    ContinuousA2CBase.prepare_dataset = wrapped_prepare_dataset
++    ContinuousA2CBase._per_cat_adv_hooked = True
++    print(
++        f"[cat_advantage] Installed per-category GAE advantage norm "
++        f"(cats={len(categories)}, floor={floor_ratio}*sigma_global, clip={clip_val}) "
++        f"+ per-cat critic diagnostics (value_loss_cat / explained_var_cat / adv_std_cat).",
++        flush=True,
++    )
++    return True
 diff --git a/isaacsimenvs/utils/pointnet_network.py b/isaacsimenvs/utils/pointnet_network.py
 new file mode 100644
 index 00000000..7374ba60
