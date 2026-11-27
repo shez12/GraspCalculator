@@ -2046,7 +2046,7 @@ index 00000000..e843c25d
 +if __name__ == "__main__":
 +    main()
 diff --git a/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py b/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
-index 310bd760..2c168488 100644
+index 310bd760..83ab275e 100644
 --- a/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
 +++ b/isaacsimenvs/tasks/simtoolreal/utils/reset_utils.py
 @@ -3,6 +3,7 @@
@@ -2149,12 +2149,12 @@ index 310bd760..2c168488 100644
      # set the reward buffer to 0
      env.reward_buf = torch.zeros(env.num_envs, device=env.device)
  
-@@ -268,6 +321,24 @@ def _reset_table_pose(env, env_ids: torch.Tensor) -> None:
+@@ -268,6 +321,44 @@ def _reset_table_pose(env, env_ids: torch.Tensor) -> None:
      pose = torch.cat([pos_local + env_origins, quat], dim=-1)
      env.table.write_root_pose_to_sim(pose, env_ids=env_ids)
  
 +def _left_hand_base_yaw_rad(env, env_ids: torch.Tensor) -> torch.Tensor:
-+    """Return per-env left-hand comfortable base yaw (rad), flipping +pi if ref_ori_lat < 0."""
++    """Return per-env left-hand comfortable base yaw (rad) aligning each asset's a_hat with u_lat."""
 +    cfg = env.cfg.reset
 +    center_rad = float(getattr(cfg, "object_init_yaw_center_deg", -150.0)) * (math.pi / 180.0)
 +    base = torch.full((env_ids.numel(),), center_rad, device=env.device, dtype=torch.float32)
@@ -2168,13 +2168,33 @@ index 310bd760..2c168488 100644
 +        for cid, sc in scorers_by_cat.items():
 +            if sc is not None and getattr(sc, "ref_ori_lat", 0.0) < 0.0:
 +                base = torch.where(cids == cid, base + math.pi, base)
++    # Subtract each asset's local a_hat (other - afford) XY yaw so world a_hat aligns with center_rad
++    clouds = getattr(env, "_asset_clouds", None)
++    if clouds is not None and asset_idx_all is not None:
++        ahat_yaw = getattr(env, "_asset_ahat_yaw_rad", None)
++        if ahat_yaw is None:
++            pts = clouds["points"].to(device=env.device, dtype=torch.float32)       # (A, M, 3)
++            aff = clouds["afford_mask"].to(device=env.device, dtype=torch.float32)  # (A, M)
++            aff_m = (aff > 0.5).float().unsqueeze(-1)
++            oth_m = (aff <= 0.5).float().unsqueeze(-1)
++            has_both = (aff_m.sum(dim=1).squeeze(-1) > 0) & (oth_m.sum(dim=1).squeeze(-1) > 0)
++            c_aff = (pts * aff_m).sum(dim=1) / aff_m.sum(dim=1).clamp_min(1.0)
++            c_oth = (pts * oth_m).sum(dim=1) / oth_m.sum(dim=1).clamp_min(1.0)
++            ahat = c_oth - c_aff
++            ahat_yaw = torch.where(
++                has_both,
++                torch.atan2(ahat[:, 1], ahat[:, 0]),
++                torch.zeros(pts.shape[0], device=env.device, dtype=torch.float32),
++            )
++            env._asset_ahat_yaw_rad = ahat_yaw
++        base = base - ahat_yaw[asset_idx_all[env_ids]]
 +    return base
 +
 +
  def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
      """Reset object pose and lifted-reward reference height."""
      cfg = env.cfg.reset
-@@ -278,6 +349,27 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
+@@ -278,6 +369,27 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
          fixed = torch.as_tensor(cfg.fixed_start_pose, device=env.device, dtype=torch.float32)
          pos_local = fixed[:3].unsqueeze(0).expand(n, -1)
          quat = fixed[3:].unsqueeze(0).expand(n, -1)
@@ -2202,7 +2222,7 @@ index 310bd760..2c168488 100644
      else:
          noise = torch.empty(n, 3, device=env.device).uniform_(-1.0, 1.0)
          pos_local = torch.stack(
-@@ -342,6 +434,38 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
+@@ -342,6 +454,38 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
          env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
          return
  
@@ -2241,7 +2261,7 @@ index 310bd760..2c168488 100644
      if mode == "delta":
          prev_pos_local = env.goal_viz.data.root_pos_w[env_ids] - env_origins
          prev_quat = env.goal_viz.data.root_quat_w[env_ids]
-@@ -394,6 +518,7 @@ def reset_env_state(env, env_ids: torch.Tensor) -> None:
+@@ -394,6 +538,7 @@ def reset_env_state(env, env_ids: torch.Tensor) -> None:
  
      _clear_goal_trackers(env, env_ids)
      env._lifted_object[env_ids] = False
